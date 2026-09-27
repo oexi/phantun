@@ -4,8 +4,10 @@
 //! block, `M` Reed-Solomon parity shards are sent, allowing the receiver to recover
 //! up to `M` lost packets per block without any retransmission. Data shards are
 //! forwarded as soon as they arrive, so FEC adds no latency when nothing is lost.
-//! A block that is not filled within the configured timeout is closed early with
-//! proportionally fewer parity shards.
+//! A block that is not filled within the configured timeout is closed early. It gets
+//! as many parity shards as it needs to be as resilient as a full block, which is more
+//! than a proportional share, since small blocks are more likely to lose more than
+//! their share of packets.
 //!
 //! Wire format, prepended to every fake TCP payload:
 //!
@@ -42,6 +44,9 @@ pub const MTU_OVERHEAD: usize = PARITY_HEADER_LEN + LEN_PREFIX;
 /// Number of recent groups the decoder keeps track of
 const MAX_GROUPS: usize = 256;
 const MAX_CODECS: usize = 64;
+/// Fraction of data shards that may stay unrecovered, used to find the loss rate a `K:M`
+/// ratio is meant for, and the parity shards smaller groups need to cope with it
+const TARGET_RESIDUAL_LOSS: f64 = 0.001;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FecConfig {
@@ -74,6 +79,48 @@ impl FecConfig {
     }
 }
 
+/// Expected fraction of data shards that can not be recovered, for a group of `k` data and `m`
+/// parity shards sent over a link losing packets randomly with probability `p`
+fn residual_loss(k: usize, m: usize, p: f64) -> f64 {
+    // a group is unrecoverable once more than `m` of its `n` shards are lost, and on average
+    // `k / n` of the lost shards are data shards
+    let n = k + m;
+    let mut pmf = (1.0 - p).powi(n as i32);
+    let mut lost = 0.0;
+    for l in 0..=n {
+        if l > m {
+            lost += pmf * l as f64;
+        }
+        pmf *= (n - l) as f64 / (l + 1) as f64 * p / (1.0 - p);
+    }
+
+    lost / n as f64
+}
+
+/// Returns the number of parity shards for groups of 1 to `k` data shards. A full group gets `m`
+/// parity shards. A smaller group gets as many as it needs to meet `TARGET_RESIDUAL_LOSS` at the
+/// highest loss rate a full group meets it at, but no less than a proportional share and no more
+/// than `m`.
+fn parity_table(k: usize, m: usize) -> Vec<usize> {
+    let (mut loss, mut hi) = (0.0, 0.5);
+    for _ in 0..50 {
+        let mid = (loss + hi) / 2.0;
+        if residual_loss(k, m, mid) <= TARGET_RESIDUAL_LOSS {
+            loss = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    (1..=k)
+        .map(|n| {
+            ((n * m).div_ceil(k)..m)
+                .find(|&p| residual_loss(n, p, loss) <= TARGET_RESIDUAL_LOSS)
+                .unwrap_or(m)
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct Codecs(HashMap<(usize, usize), ReedSolomon>);
 
@@ -92,6 +139,8 @@ impl Codecs {
 
 struct Encoder {
     config: FecConfig,
+    /// Number of parity shards by number of data shards in the group, minus one
+    parity: Vec<usize>,
     group: u32,
     shards: Vec<Vec<u8>>,
     started: Option<Instant>,
@@ -102,6 +151,7 @@ impl Encoder {
     fn new(config: FecConfig) -> Encoder {
         Encoder {
             config,
+            parity: parity_table(config.data_shards, config.parity_shards),
             group: 0,
             shards: Vec::with_capacity(config.data_shards),
             started: None,
@@ -143,10 +193,7 @@ impl Encoder {
     /// Closes the current group and returns its parity shards
     fn finish(&mut self) -> Vec<Vec<u8>> {
         let k = self.shards.len();
-        // a group closed by timeout gets proportionally fewer parity shards
-        let m = (k * self.config.parity_shards)
-            .div_ceil(self.config.data_shards)
-            .max(1);
+        let m = self.parity[k - 1];
         let shard_size = LEN_PREFIX + self.shards.iter().map(Vec::len).max().unwrap_or(0);
 
         let data: Vec<Vec<u8>> = self
@@ -498,11 +545,41 @@ mod tests {
     }
 
     #[test]
+    fn residual_loss_rate() {
+        // one data and one parity shard are unrecoverable only if both are lost
+        assert!((residual_loss(1, 1, 0.1) - 0.01).abs() < 1e-12);
+        assert_eq!(residual_loss(10, 3, 0.0), 0.0);
+        assert!((residual_loss(10, 3, 1.0 - 1e-9) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parity_for_small_groups() {
+        assert_eq!(parity_table(1, 1), [1]);
+        assert_eq!(parity_table(10, 3), [2, 2, 2, 3, 3, 3, 3, 3, 3, 3]);
+        assert_eq!(parity_table(10, 9), [4, 5, 6, 6, 7, 7, 8, 8, 9, 9]);
+        assert_eq!(
+            parity_table(20, 2),
+            [1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        );
+        assert_eq!(
+            parity_table(20, 14),
+            [
+                4, 5, 6, 6, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 14
+            ]
+        );
+
+        let table = parity_table(200, 56);
+        assert_eq!(table.len(), 200);
+        assert!(table.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(table[199], 56);
+    }
+
+    #[test]
     fn no_loss() {
         let datagrams: Vec<_> = (0..25).map(datagram).collect();
         let frames = encode(&mut Encoder::new(config(10, 3)), &datagrams);
-        // 2 full groups with 3 parity each, and a group of 5 closed with ceil(5 * 3 / 10) = 2 parity
-        assert_eq!(frames.len(), 25 + 3 + 3 + 2);
+        // 2 full groups and a group of 5 closed by timeout, all with 3 parity each
+        assert_eq!(frames.len(), 25 + 3 + 3 + 3);
 
         let delivered = decode(&mut Decoder::default(), frames.iter());
         assert_eq!(delivered, datagrams);
@@ -547,13 +624,11 @@ mod tests {
     fn recover_partial_group() {
         let datagrams: Vec<_> = (0..3).map(datagram).collect();
         let frames = encode(&mut Encoder::new(config(10, 4)), &datagrams);
-        // ceil(3 * 4 / 10) = 2 parity shards
-        assert_eq!(frames.len(), 5);
+        // 3 parity shards rather than a proportional share of 2
+        assert_eq!(frames.len(), 6);
 
-        let delivered = decode(
-            &mut Decoder::default(),
-            [&frames[1], &frames[3], &frames[4]].into_iter(),
-        );
+        // every data shard lost
+        let delivered = decode(&mut Decoder::default(), frames[3..].iter());
         assert_eq!(sorted(delivered), sorted(datagrams));
     }
 
@@ -584,7 +659,7 @@ mod tests {
         );
         assert_eq!(
             encoder.flush_expired(now + Duration::from_millis(10)).len(),
-            1
+            2
         );
         assert_eq!(encoder.deadline(), None);
     }
