@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 #
 # Dockerfile for phantun
 #
@@ -5,30 +7,39 @@
 #
 # Build stage
 #
-FROM rust:latest AS builder
+# Keep the builder and runtime on the same Debian release so the
+# binaries never link against a newer glibc than the runtime provides.
+FROM rust:1-trixie AS builder
 
 WORKDIR /usr/src/phantun
 COPY . .
 
-# Strip debug symbols from release binaries
 ENV CARGO_PROFILE_RELEASE_STRIP=true
+ENV CARGO_PROFILE_RELEASE_LTO=true
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
-RUN cargo build --release
+# target/ lives in a cache mount, so copy the binaries out in the same step
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/phantun/target \
+    cargo build --release --locked \
+    && install target/release/server /usr/local/bin/phantun-server \
+    && install target/release/client /usr/local/bin/phantun-client
 
 #
 # Runtime stage
 #
-FROM debian:stable-slim
+FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     iproute2 \
     procps \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/src/phantun/target/release/client /usr/local/bin/phantun-client
-COPY --from=builder /usr/src/phantun/target/release/server /usr/local/bin/phantun-server
+COPY --from=builder /usr/local/bin/phantun-server /usr/local/bin/
+COPY --from=builder /usr/local/bin/phantun-client /usr/local/bin/
 COPY docker/phantun.sh /usr/local/bin/
 
 ENV USE_IPTABLES_NFT_BACKEND=1
