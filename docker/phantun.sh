@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# alias ​​settings must be global, and must be defined before the function being called with the alias
+# alias settings must be global, and must be defined before the function being called with the alias
 if [ "$USE_IPTABLES_NFT_BACKEND" = 1 ]; then
   alias iptables=iptables-nft
   alias iptables-save=iptables-nft-save
@@ -105,7 +105,6 @@ apply_sysctl() {
 
 apply_iptables() {
   local interface=$(_get_default_iface)
-  local address=$(_get_addr_by_iface "${interface}")
   local tun=$(_get_tun_from_args "$@")
   local peer=$(_get_peer_from_args "$@")
   local port=$(_get_port_from_args "$@")
@@ -116,14 +115,16 @@ apply_iptables() {
   else
     _iptables -A FORWARD -i $tun -j ACCEPT -m comment --comment "${comment}" || error "iptables filter rule add failed."
     _iptables -A FORWARD -o $tun -j ACCEPT -m comment --comment "${comment}" || error "iptables filter rule add failed."
+
     if _is_server_mode "$1"; then
+      local address=$(_get_addr_by_iface "${interface}")
       info "iptables DNAT rule added: [${comment}]: ${interface} -> ${tun}, ${address} -> ${peer}"
       _iptables -t nat -A PREROUTING -p tcp -i $interface --dport $port -j DNAT --to-destination $peer \
         -m comment --comment "${comment}" || error "iptables DNAT rule add failed."
     else
-      info "iptables SNAT rule added: [${comment}]: ${tun} -> ${interface}, ${peer} -> ${address}"
-      _iptables -t nat -A POSTROUTING -s $peer -o $interface -j SNAT --to-source $address \
-        -m comment --comment "${comment}" || error "iptables SNAT rule add failed."
+      info "iptables MASQUERADE rule added: [${comment}]: ${tun} -> ${interface} (peer ${peer})"
+      _iptables -t nat -A POSTROUTING -s $peer -o $interface -j MASQUERADE \
+        -m comment --comment "${comment}" || error "iptables MASQUERADE rule add failed."
     fi
   fi
 }
@@ -132,7 +133,6 @@ apply_ip6tables() {
   ! _is_ipv4_only "$@" || return
 
   local interface=$(_get_default6_iface)
-  local address=$(_get_addr6_by_iface "${interface}")
   local tun=$(_get_tun_from_args "$@")
   local peer=$(_get_peer6_from_args "$@")
   local port=$(_get_port_from_args "$@")
@@ -143,20 +143,22 @@ apply_ip6tables() {
   else
     _ip6tables -A FORWARD -i $tun -j ACCEPT -m comment --comment "${comment}" || error "ip6tables filter rule add failed."
     _ip6tables -A FORWARD -o $tun -j ACCEPT -m comment --comment "${comment}" || error "ip6tables filter rule add failed."
+
     if _is_server_mode "$1"; then
+      local address=$(_get_addr6_by_iface "${interface}")
       info "ip6tables DNAT rule added: [${comment}]: ${interface} -> ${tun}, ${address} -> ${peer}"
       _ip6tables -t nat -A PREROUTING -p tcp -i $interface --dport $port -j DNAT --to-destination $peer \
         -m comment --comment "${comment}" || error "ip6tables DNAT rule add failed."
     else
-      info "ip6tables SNAT rule added: [${comment}]: ${tun} -> ${interface}, ${peer} -> ${address}"
-      _ip6tables -t nat -A POSTROUTING -s $peer -o $interface -j SNAT --to-source $address \
-        -m comment --comment "${comment}" || error "ip6tables SNAT rule add failed."
+      info "ip6tables MASQUERADE rule added: [${comment}]: ${tun} -> ${interface} (peer ${peer})"
+      _ip6tables -t nat -A POSTROUTING -s $peer -o $interface -j MASQUERADE \
+        -m comment --comment "${comment}" || error "ip6tables MASQUERADE rule add failed."
     fi
   fi
 }
 
 stop_process() {
-  kill $(pidof phantun-server phantun-client)
+  kill $(pidof phantun-server phantun-client 2>/dev/null) 2>/dev/null
   info "terminate phantun process."
 }
 
