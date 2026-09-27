@@ -2,12 +2,14 @@ use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
+use phantun::fec::{self, Fec, FecConfig, HEADROOM};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
 use tokio_tun::TunBuilder;
@@ -101,6 +103,24 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("fec")
+                .long("fec")
+                .required(false)
+                .value_name("K:M")
+                .help("Enables forward error correction: after every K packets, M parity packets are \
+                       sent so that up to M lost packets can be recovered by the peer. \
+                       Must be enabled on both ends, K:M can differ per direction. \
+                       Reduce the WireGuard MTU by another 10 bytes when enabled")
+        )
+        .arg(
+            Arg::new("fec_timeout")
+                .long("fec-timeout")
+                .required(false)
+                .value_name("MS")
+                .help("Sends parity packets for a group of less than K packets after this many milliseconds")
+                .default_value("8")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -148,6 +168,22 @@ async fn main() -> io::Result<()> {
         .map(fs::read)
         .transpose()?;
 
+    let fec_config = matches.get_one::<String>("fec").map(|ratio| {
+        let timeout = matches
+            .get_one::<String>("fec_timeout")
+            .unwrap()
+            .parse()
+            .expect("bad FEC timeout");
+        FecConfig::parse(ratio, Duration::from_millis(timeout))
+            .unwrap_or_else(|e| panic!("bad FEC ratio: {e}"))
+    });
+    if let Some(c) = fec_config {
+        info!(
+            "FEC enabled: {}:{}, timeout {:?}",
+            c.data_shards, c.parity_shards, c.timeout
+        );
+    }
+
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
@@ -167,7 +203,9 @@ async fn main() -> io::Result<()> {
     info!("Created TUN device {}", tun[0].name());
 
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
-    let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
+    let connections = Arc::new(RwLock::new(
+        HashMap::<SocketAddr, (Arc<Socket>, Option<Arc<Fec>>)>::new(),
+    ));
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
 
@@ -175,13 +213,14 @@ async fn main() -> io::Result<()> {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
-            let (size, udp_remote_addr, udp_local_addr) = udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
+            let (size, udp_remote_addr, udp_local_addr) =
+                udp_recv_pktinfo(&udp_sock, &mut buf_r[HEADROOM..]).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
-            if let Some(sock) = connections.read().await.get(&udp_remote_addr) {
-                sock.send(&buf_r[..size]).await;
+            if let Some((sock, fec)) = connections.read().await.get(&udp_remote_addr) {
+                fec::send_datagram(sock, fec.as_deref(), &mut buf_r[..HEADROOM + size]).await;
                 continue;
             }
 
@@ -202,15 +241,20 @@ async fn main() -> io::Result<()> {
                 debug!("Sent handshake packet to: {}", sock);
             }
 
+            let fec = fec_config.map(|c| Arc::new(Fec::new(c)));
+
             // send first packet
-            if sock.send(&buf_r[..size]).await.is_none() {
+            if fec::send_datagram(&sock, fec.as_deref(), &mut buf_r[..HEADROOM + size])
+                .await
+                .is_none()
+            {
                 continue;
             }
 
             assert!(connections
                 .write()
                 .await
-                .insert(udp_remote_addr, sock.clone())
+                .insert(udp_remote_addr, (sock.clone(), fec.clone()))
                 .is_none());
             debug!("inserted fake TCP socket into connection table");
 
@@ -220,14 +264,29 @@ async fn main() -> io::Result<()> {
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
 
+            if let Some(ref fec) = fec {
+                let sock = sock.clone();
+                let fec = fec.clone();
+                let quit = quit.clone();
+
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = fec.run_flusher(&sock) => quit.cancel(),
+                        _ = quit.cancelled() => {},
+                    }
+                });
+            }
+
             for i in 0..num_cpus {
                 let sock = sock.clone();
+                let fec = fec.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
                     let mut buf_tcp = [0u8; MAX_PACKET_LEN];
+                    let mut recovered = Vec::new();
                     // Always reply from the same address that the peer used to communicate with
                     // us. This avoids a frequent problem with IPv6 privacy extensions when we
                     // erroneously bind to wrong short-lived temporary address even if the peer
@@ -259,8 +318,8 @@ async fn main() -> io::Result<()> {
 
                     loop {
                         tokio::select! {
-                            Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
+                            Ok(size) = udp_sock.recv(&mut buf_udp[HEADROOM..]) => {
+                                if fec::send_datagram(&sock, fec.as_deref(), &mut buf_udp[..HEADROOM + size]).await.is_none() {
                                     debug!("removed fake TCP socket from connections table");
                                     quit.cancel();
                                     return;
@@ -272,7 +331,7 @@ async fn main() -> io::Result<()> {
                                 match res {
                                     Some(size) => {
                                         if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                            && let Err(e) = fec::forward_to_udp(&udp_sock, fec.as_deref(), &buf_tcp[..size], &mut recovered).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
                                                 return;
