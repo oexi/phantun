@@ -327,19 +327,24 @@ without retransmission, at the cost of extra bandwidth:
 
 For every group of `K` packets, the peer can recover any `M` lost packets out of the `K + M`
 packets sent. Packets are forwarded as soon as they arrive, so FEC adds no latency when nothing is
-lost. A group that is not filled within `--fec-timeout` is closed early with proportionally fewer
-parity packets (at least one), so sparse traffic is protected too.
+lost.
+
+A group that is not filled within `--fec-timeout` is closed early. Small groups are more likely to
+lose more than their share of packets, so such a group gets as many parity packets as it needs to
+be as resilient as a full group, up to `M`. E.g. with `10:9`, a single packet gets 4 parity
+packets. This keeps sparse traffic, such as games or SSH, protected, at the cost of more overhead
+when traffic is too slow to fill groups within `--fec-timeout`.
 
 FEC must be enabled on **both** Client and Server, as it changes the payload format. `K:M` controls
 the parity sent by each end and may differ per direction, e.g. more parity on the direction with
-more loss. Bandwidth overhead is `M / K`, e.g.:
+more loss. Bandwidth overhead is `M / K` when groups are filled, e.g.:
 
 | Link loss | Suggested `K:M` | Overhead |
 |-----------|-----------------|----------|
 | ~1%       | `20:2`          | 10%      |
 | ~5%       | `10:3`          | 30%      |
 | ~10%      | `10:5`          | 50%      |
-| ~20%      | `10:8`          | 80%      |
+| ~20%      | `10:9`          | 90%      |
 
 FEC adds a 6 byte header to data packets and parity packets are 10 bytes larger than the largest
 packet of their group, so remember to lower the [MTU](#mtu-calculation-for-wireguard) accordingly.
