@@ -7,31 +7,32 @@
 #
 FROM rust:latest AS builder
 
-COPY . /phantun
+WORKDIR /usr/src/phantun
+COPY . .
 
-RUN cd phantun \
-  && cargo build --release \
-  && strip target/release/server target/release/client \
-  && install target/release/server /usr/local/bin/phantun-server \
-  && install target/release/client /usr/local/bin/phantun-client \
-  && cd - \
-  && rm -r phantun
+# Strip debug symbols from release binaries
+ENV CARGO_PROFILE_RELEASE_STRIP=true
+
+RUN cargo build --release
 
 #
 # Runtime stage
 #
-FROM debian:latest
+FROM debian:stable-slim
 
-COPY --from=builder /usr/local/bin/phantun-server /usr/local/bin/
-COPY --from=builder /usr/local/bin/phantun-client /usr/local/bin/
-COPY docker/phantun.sh /usr/local/bin/
 RUN apt-get update && apt-get install -y \
-    iproute2 \
     iptables \
-    procps
+    iproute2 \
+    procps \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV USE_IPTABLES_NFT_BACKEND=0
-ENV RUST_LOG=INFO
+COPY --from=builder /usr/src/phantun/target/release/client /usr/local/bin/phantun-client
+COPY --from=builder /usr/src/phantun/target/release/server /usr/local/bin/phantun-server
+COPY docker/phantun.sh /usr/local/bin/
+
+ENV USE_IPTABLES_NFT_BACKEND=1
+ENV RUST_LOG=info
 
 ENTRYPOINT ["phantun.sh"]
 CMD ["phantun-server", "--help"]
