@@ -25,6 +25,7 @@ A lightweight and fast UDP to TCP obfuscator.
         * [Client](#client)
 * [MTU overhead](#mtu-overhead)
     * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
+* [Forward error correction (FEC)](#forward-error-correction-fec)
 * [Version compatibility](#version-compatibility)
 * [Documentations](#documentations)
 * [Performance](#performance)
@@ -308,6 +309,40 @@ in the IP header to prevent intermediate devices performing any fragmentation on
 It is also *strongly recommended* to use the same interface
 MTU for both ends of a WireGuard tunnel, or unexpected packet loss may occur and these issues are
 generally very hard to troubleshoot.
+
+When [FEC](#forward-error-correction-fec) is enabled, subtract another 10 bytes, e.g.
+`1418 bytes` for IPv4 and `1398 bytes` for IPv6 on a 1500 bytes MTU link.
+
+[Back to TOC](#table-of-contents)
+
+# Forward error correction (FEC)
+
+Phantun never retransmits lost packets. On lossy links, FEC can be enabled to recover lost packets
+without retransmission, at the cost of extra bandwidth:
+
+```
+--fec K:M           after every K packets, send M Reed-Solomon parity packets
+--fec-timeout MS    send parity for a partially filled group after MS milliseconds (default: 8)
+```
+
+For every group of `K` packets, the peer can recover any `M` lost packets out of the `K + M`
+packets sent. Packets are forwarded as soon as they arrive, so FEC adds no latency when nothing is
+lost. A group that is not filled within `--fec-timeout` is closed early with proportionally fewer
+parity packets (at least one), so sparse traffic is protected too.
+
+FEC must be enabled on **both** Client and Server, as it changes the payload format. `K:M` controls
+the parity sent by each end and may differ per direction, e.g. more parity on the direction with
+more loss. Bandwidth overhead is `M / K`, e.g.:
+
+| Link loss | Suggested `K:M` | Overhead |
+|-----------|-----------------|----------|
+| ~1%       | `20:2`          | 10%      |
+| ~5%       | `10:3`          | 30%      |
+| ~10%      | `10:5`          | 50%      |
+| ~20%      | `10:8`          | 80%      |
+
+FEC adds a 6 byte header to data packets and parity packets are 10 bytes larger than the largest
+packet of their group, so remember to lower the [MTU](#mtu-calculation-for-wireguard) accordingly.
 
 [Back to TOC](#table-of-contents)
 

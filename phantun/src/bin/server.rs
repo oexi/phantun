@@ -2,11 +2,13 @@ use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::Stack;
 use log::{debug, error, info};
+use phantun::fec::{self, Fec, FecConfig, HEADROOM};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::time;
@@ -101,6 +103,24 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("fec")
+                .long("fec")
+                .required(false)
+                .value_name("K:M")
+                .help("Enables forward error correction: after every K packets, M parity packets are \
+                       sent so that up to M lost packets can be recovered by the peer. \
+                       Must be enabled on both ends, K:M can differ per direction. \
+                       Reduce the WireGuard MTU by another 10 bytes when enabled")
+        )
+        .arg(
+            Arg::new("fec_timeout")
+                .long("fec-timeout")
+                .required(false)
+                .value_name("MS")
+                .help("Sends parity packets for a group of less than K packets after this many milliseconds")
+                .default_value("8")
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -147,6 +167,22 @@ async fn main() -> io::Result<()> {
         .map(fs::read)
         .transpose()?;
 
+    let fec_config = matches.get_one::<String>("fec").map(|ratio| {
+        let timeout = matches
+            .get_one::<String>("fec_timeout")
+            .unwrap()
+            .parse()
+            .expect("bad FEC timeout");
+        FecConfig::parse(ratio, Duration::from_millis(timeout))
+            .unwrap_or_else(|e| panic!("bad FEC ratio: {e}"))
+    });
+    if let Some(c) = fec_config {
+        info!(
+            "FEC enabled: {}:{}, timeout {:?}",
+            c.data_shards, c.parity_shards, c.timeout
+        );
+    }
+
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
@@ -188,6 +224,20 @@ async fn main() -> io::Result<()> {
 
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
+            let fec = fec_config.map(|c| Arc::new(Fec::new(c)));
+
+            if let Some(ref fec) = fec {
+                let sock = sock.clone();
+                let fec = fec.clone();
+                let quit = quit.clone();
+
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = fec.run_flusher(&sock) => quit.cancel(),
+                        _ = quit.cancelled() => {},
+                    }
+                });
+            }
             let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -199,17 +249,19 @@ async fn main() -> io::Result<()> {
 
             for i in 0..num_cpus {
                 let sock = sock.clone();
+                let fec = fec.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
                 let udp_sock = new_udp_reuseport(local_addr);
 
                 tokio::spawn(async move {
                     udp_sock.connect(remote_addr).await.unwrap();
+                    let mut recovered = Vec::new();
 
                     loop {
                         tokio::select! {
-                            Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
+                            Ok(size) = udp_sock.recv(&mut buf_udp[HEADROOM..]) => {
+                                if fec::send_datagram(&sock, fec.as_deref(), &mut buf_udp[..HEADROOM + size]).await.is_none() {
                                     quit.cancel();
                                     return;
                                 }
@@ -220,7 +272,7 @@ async fn main() -> io::Result<()> {
                                 match res {
                                     Some(size) => {
                                         if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                            && let Err(e) = fec::forward_to_udp(&udp_sock, fec.as_deref(), &buf_tcp[..size], &mut recovered).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
                                                 return;
