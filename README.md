@@ -26,6 +26,7 @@ A lightweight and fast UDP to TCP obfuscator.
 * [MTU overhead](#mtu-overhead)
     * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
 * [Forward error correction (FEC)](#forward-error-correction-fec)
+    * [Burst loss](#burst-loss)
 * [Version compatibility](#version-compatibility)
 * [Documentations](#documentations)
 * [Performance](#performance)
@@ -323,6 +324,7 @@ without retransmission, at the cost of extra bandwidth:
 ```
 --fec K:M           after every K packets, send M Reed-Solomon parity packets
 --fec-timeout MS    send parity for a partially filled group after MS milliseconds (default: 8)
+--fec-interval MS   spread the parity packets of a group over MS milliseconds (default: 0, off, max: 1000)
 ```
 
 For every group of `K` packets, the peer can recover any `M` lost packets out of the `K + M`
@@ -348,6 +350,21 @@ more loss. Bandwidth overhead is `M / K` when groups are filled, e.g.:
 
 FEC adds a 6 byte header to data packets and parity packets are 10 bytes larger than the largest
 packet of their group, so remember to lower the [MTU](#mtu-calculation-for-wireguard) accordingly.
+
+## Burst loss
+
+The parity packets of a group are sent back to back, so on links that lose packets in bursts
+rather than randomly, such as poor Wi-Fi or mobile links, a single burst often takes out a whole
+group, and more parity does not help. `--fec-interval MS` spreads the parity packets of each group
+evenly over `MS` milliseconds instead. The first parity packet is still sent right away, so an
+isolated loss is recovered as quickly as before, but a packet lost in a burst may only be recovered
+up to `MS` milliseconds later. Data packets are never delayed.
+
+To help, the interval has to be longer than the bursts it should survive, which makes it a
+trade-off for latency sensitive traffic such as games: a packet recovered too late may be of no use
+anymore. Leave it off on links with random loss, where it only delays recovery. The peer only
+remembers the last 256 groups, so keep the interval well below the time it takes to send that many.
+Like `K:M`, it only applies to the parity sent by the end it is set on.
 
 [Back to TOC](#table-of-contents)
 

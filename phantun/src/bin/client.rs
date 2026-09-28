@@ -121,6 +121,17 @@ async fn main() -> io::Result<()> {
                 .help("Sends parity packets for a group of less than K packets after this many milliseconds")
                 .default_value("8")
         )
+        .arg(
+            Arg::new("fec_interval")
+                .long("fec-interval")
+                .required(false)
+                .value_name("MS")
+                .help("Spreads the parity packets of each group evenly over this many milliseconds \
+                       instead of sending them back to back, so that a burst of loss is less likely \
+                       to take out a whole group. The first parity packet is still sent right away, \
+                       but recovery from a burst may be delayed by up to this much. 0 disables, at most 1000")
+                .default_value("0")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -174,13 +185,22 @@ async fn main() -> io::Result<()> {
             .unwrap()
             .parse()
             .expect("bad FEC timeout");
-        FecConfig::parse(ratio, Duration::from_millis(timeout))
-            .unwrap_or_else(|e| panic!("bad FEC ratio: {e}"))
+        let interval = matches
+            .get_one::<String>("fec_interval")
+            .unwrap()
+            .parse()
+            .expect("bad FEC interval");
+        FecConfig::parse(
+            ratio,
+            Duration::from_millis(timeout),
+            Duration::from_millis(interval),
+        )
+        .unwrap_or_else(|e| panic!("bad FEC parameters: {e}"))
     });
     if let Some(c) = fec_config {
         info!(
-            "FEC enabled: {}:{}, timeout {:?}",
-            c.data_shards, c.parity_shards, c.timeout
+            "FEC enabled: {}:{}, timeout {:?}, parity spread over {:?}",
+            c.data_shards, c.parity_shards, c.timeout, c.interval
         );
     }
 
