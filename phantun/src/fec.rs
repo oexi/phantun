@@ -9,6 +9,11 @@
 //! than a proportional share, since small blocks are more likely to lose more than
 //! their share of packets.
 //!
+//! Parity shards are sent back to back by default, so a burst of loss can take out a whole
+//! block. With a spreading interval, only the first parity shard is sent right away and the
+//! others are spread evenly over the interval, trading recovery delay under burst loss for a
+//! better chance that enough shards of the block get through.
+//!
 //! Wire format, prepended to every fake TCP payload:
 //!
 //! ```text
@@ -24,7 +29,8 @@
 
 use fake_tcp::Socket;
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -47,18 +53,25 @@ const MAX_CODECS: usize = 64;
 /// Fraction of data shards that may stay unrecovered, used to find the loss rate a `K:M`
 /// ratio is meant for, and the parity shards smaller groups need to cope with it
 const TARGET_RESIDUAL_LOSS: f64 = 0.001;
+/// Most parity shards a connection keeps waiting when they are spread out. Beyond this, parity
+/// shards are sent right away rather than growing the queue without bound.
+const MAX_PENDING_PARITY: usize = 4096;
+/// Longest time parity shards may be spread over, far longer than any burst worth riding out
+const MAX_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FecConfig {
     pub data_shards: usize,
     pub parity_shards: usize,
     pub timeout: Duration,
+    /// Time over which the parity shards of a group are spread out, zero sends them back to back
+    pub interval: Duration,
 }
 
 impl FecConfig {
     /// Parses `K:M`, where `K` is the number of data shards and `M` the number of parity shards
     /// per group.
-    pub fn parse(ratio: &str, timeout: Duration) -> Result<FecConfig, String> {
+    pub fn parse(ratio: &str, timeout: Duration, interval: Duration) -> Result<FecConfig, String> {
         let (k, m) = ratio
             .split_once(':')
             .ok_or_else(|| format!("expected K:M, got \"{ratio}\""))?;
@@ -70,12 +83,59 @@ impl FecConfig {
                 "K and M must be at least 1 and K + M must not exceed 256, got \"{ratio}\""
             ));
         }
+        if interval > MAX_INTERVAL {
+            return Err(format!(
+                "the interval must not exceed {MAX_INTERVAL:?}, got {interval:?}"
+            ));
+        }
 
         Ok(FecConfig {
             data_shards: k,
             parity_shards: m,
             timeout,
+            interval,
         })
+    }
+}
+
+/// Offsets from the close of a group at which its `count` parity shards are sent, spread evenly
+/// over `interval`. The first one is always sent right away, so a single lost packet is recovered
+/// as quickly as without spreading, and only a burst of loss has to wait for the later ones.
+fn parity_offsets(count: usize, interval: Duration) -> impl Iterator<Item = Duration> {
+    (0..count).map(move |i| {
+        if count > 1 {
+            interval * i as u32 / (count - 1) as u32
+        } else {
+            Duration::ZERO
+        }
+    })
+}
+
+/// Parity shards waiting to be sent, when they are spread out over time
+#[derive(Default)]
+struct Pacer {
+    /// `(send at, sequence, frame)`, the sequence number keeps shards due at the same time in order
+    queue: BinaryHeap<Reverse<(Instant, u64, Vec<u8>)>>,
+    seq: u64,
+}
+
+impl Pacer {
+    fn push(&mut self, at: Instant, frame: Vec<u8>) {
+        self.queue.push(Reverse((at, self.seq, frame)));
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    /// When the next shard is due, or `None` if nothing is queued
+    fn next(&self) -> Option<Instant> {
+        self.queue.peek().map(|Reverse((at, _, _))| *at)
+    }
+
+    /// Moves every shard due at `now` to `out`, in the order they are due
+    fn pop_due(&mut self, now: Instant, out: &mut Vec<Vec<u8>>) {
+        while self.next().is_some_and(|at| at <= now) {
+            let Reverse((_, _, frame)) = self.queue.pop().unwrap();
+            out.push(frame);
+        }
     }
 }
 
@@ -390,7 +450,10 @@ impl Decoder {
 pub struct Fec {
     encoder: Mutex<Encoder>,
     decoder: Mutex<Decoder>,
-    group_started: Notify,
+    pacer: Mutex<Pacer>,
+    interval: Duration,
+    /// Wakes the flusher when a group starts or parity shards are queued
+    wake: Notify,
 }
 
 impl Fec {
@@ -398,28 +461,61 @@ impl Fec {
         Fec {
             encoder: Mutex::new(Encoder::new(config)),
             decoder: Mutex::new(Decoder::default()),
-            group_started: Notify::new(),
+            pacer: Mutex::new(Pacer::default()),
+            interval: config.interval,
+            wake: Notify::new(),
         }
     }
 
-    /// Sends parity shards of groups that have not been filled within the timeout.
-    /// Returns once `sock` fails.
+    /// Sends parity shards of groups that have not been filled within the timeout, and parity
+    /// shards that were spread out once they are due. Returns once `sock` fails.
     pub async fn run_flusher(&self, sock: &Socket) {
+        let mut out = Vec::new();
         loop {
             let deadline = self.encoder.lock().unwrap().deadline();
-            match deadline {
-                Some(deadline) => {
-                    time::sleep_until(deadline.into()).await;
-                    let parity = self.encoder.lock().unwrap().flush_expired(Instant::now());
-                    for p in parity {
-                        if sock.send(&p).await.is_none() {
-                            return;
-                        }
-                    }
+            let due = self.pacer.lock().unwrap().next();
+            match deadline.into_iter().chain(due).min() {
+                // a group closing or parity being queued may need an earlier wake up
+                Some(next) => tokio::select! {
+                    _ = time::sleep_until(next.into()) => {}
+                    _ = self.wake.notified() => {}
+                },
+                None => self.wake.notified().await,
+            }
+
+            let now = Instant::now();
+            let parity = self.encoder.lock().unwrap().flush_expired(now);
+            out.extend(self.schedule(parity, now));
+            self.pacer.lock().unwrap().pop_due(now, &mut out);
+            for p in out.drain(..) {
+                if sock.send(&p).await.is_none() {
+                    return;
                 }
-                None => self.group_started.notified().await,
             }
         }
+    }
+
+    /// Takes the parity shards of a group that closed at `now` and returns those to send right
+    /// away. When they are spread out, the others are queued for the flusher to send later.
+    fn schedule(&self, parity: Vec<Vec<u8>>, now: Instant) -> Vec<Vec<u8>> {
+        if self.interval.is_zero() || parity.len() <= 1 {
+            return parity;
+        }
+
+        let mut send_now = Vec::new();
+        let mut pacer = self.pacer.lock().unwrap();
+        let offsets = parity_offsets(parity.len(), self.interval);
+        for (p, offset) in parity.into_iter().zip(offsets) {
+            if offset.is_zero() || pacer.queue.len() >= MAX_PENDING_PARITY {
+                send_now.push(p);
+            } else {
+                pacer.push(now + offset, p);
+            }
+        }
+        drop(pacer);
+        self.wake.notify_one();
+
+        send_now
     }
 }
 
@@ -432,15 +528,17 @@ pub async fn send_datagram(sock: &Socket, fec: Option<&Fec>, buf: &mut [u8]) -> 
         return sock.send(&buf[HEADROOM..]).await;
     };
 
+    let now = Instant::now();
     let parity = {
         let mut encoder = fec.encoder.lock().unwrap();
         let group_started = encoder.started.is_none();
-        let parity = encoder.push(buf, Instant::now());
+        let parity = encoder.push(buf, now);
         if group_started && encoder.started.is_some() {
-            fec.group_started.notify_one();
+            fec.wake.notify_one();
         }
         parity
     };
+    let parity = fec.schedule(parity, now);
 
     sock.send(buf).await?;
     for p in parity {
@@ -483,6 +581,7 @@ mod tests {
             data_shards: k,
             parity_shards: m,
             timeout: Duration::from_millis(10),
+            interval: Duration::ZERO,
         }
     }
 
@@ -529,19 +628,91 @@ mod tests {
     #[test]
     fn parse_config() {
         let t = Duration::from_millis(8);
+        let i = Duration::from_millis(20);
         assert_eq!(
-            FecConfig::parse("10:3", t),
+            FecConfig::parse("10:3", t, i),
             Ok(FecConfig {
                 data_shards: 10,
                 parity_shards: 3,
-                timeout: t
+                timeout: t,
+                interval: i,
             })
         );
-        assert!(FecConfig::parse("10", t).is_err());
-        assert!(FecConfig::parse("0:3", t).is_err());
-        assert!(FecConfig::parse("10:0", t).is_err());
-        assert!(FecConfig::parse("200:57", t).is_err());
-        assert!(FecConfig::parse("200:56", t).is_ok());
+        assert!(FecConfig::parse("10", t, i).is_err());
+        assert!(FecConfig::parse("0:3", t, i).is_err());
+        assert!(FecConfig::parse("10:0", t, i).is_err());
+        assert!(FecConfig::parse("200:57", t, i).is_err());
+        assert!(FecConfig::parse("200:56", t, i).is_ok());
+        assert!(FecConfig::parse("10:3", t, MAX_INTERVAL).is_ok());
+        assert!(FecConfig::parse("10:3", t, MAX_INTERVAL + Duration::from_millis(1)).is_err());
+    }
+
+    #[test]
+    fn parity_spread_offsets() {
+        let ms = Duration::from_millis;
+        assert_eq!(parity_offsets(1, ms(9)).collect::<Vec<_>>(), [ms(0)]);
+        assert_eq!(
+            parity_offsets(4, ms(9)).collect::<Vec<_>>(),
+            [ms(0), ms(3), ms(6), ms(9)]
+        );
+        assert!(parity_offsets(3, Duration::ZERO).all(|d| d.is_zero()));
+    }
+
+    /// Frames standing in for parity shards, tagged by group and index
+    fn fake_parity(group: u8, count: u8) -> Vec<Vec<u8>> {
+        (0..count).map(|i| vec![group, i]).collect()
+    }
+
+    #[test]
+    fn parity_back_to_back_without_interval() {
+        let fec = Fec::new(config(10, 3));
+        let now = Instant::now();
+        assert_eq!(fec.schedule(fake_parity(0, 3), now), fake_parity(0, 3));
+        assert_eq!(fec.pacer.lock().unwrap().next(), None);
+    }
+
+    #[test]
+    fn parity_spread_over_interval() {
+        let fec = Fec::new(FecConfig {
+            interval: Duration::from_millis(20),
+            ..config(10, 3)
+        });
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+
+        // only the first parity shard goes out right away
+        assert_eq!(fec.schedule(fake_parity(0, 3), t0), [vec![0, 0]]);
+        // a second group closing while the first one is still being spread out
+        assert_eq!(fec.schedule(fake_parity(1, 3), t0 + ms(5)), [vec![1, 0]]);
+
+        let mut pacer = fec.pacer.lock().unwrap();
+        assert_eq!(pacer.next(), Some(t0 + ms(10)));
+
+        let mut out = Vec::new();
+        pacer.pop_due(t0 + ms(9), &mut out);
+        assert!(out.is_empty());
+
+        // shards of both groups come out interleaved, in the order they are due
+        pacer.pop_due(t0 + ms(25), &mut out);
+        assert_eq!(out, [vec![0, 1], vec![1, 1], vec![0, 2], vec![1, 2]]);
+        assert_eq!(pacer.next(), None);
+    }
+
+    #[test]
+    fn bounded_pending_parity() {
+        let fec = Fec::new(FecConfig {
+            interval: Duration::from_millis(20),
+            ..config(1, 2)
+        });
+        let now = Instant::now();
+        let mut sent_now = 0;
+        for g in 0..=MAX_PENDING_PARITY {
+            sent_now += fec.schedule(fake_parity(g as u8, 2), now).len();
+        }
+
+        // once the queue is full, parity shards are sent right away instead of queued
+        assert_eq!(fec.pacer.lock().unwrap().queue.len(), MAX_PENDING_PARITY);
+        assert_eq!(sent_now, MAX_PENDING_PARITY + 2);
     }
 
     #[test]
