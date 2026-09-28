@@ -143,8 +143,12 @@ _enable_sysctl() {
   local out
   if [ "$(sysctl -n "$1" 2>/dev/null)" = 1 ]; then
     info "sysctl: $1 is already enabled."
-  elif out=$(sysctl -w "$1=1" 2>&1); then
-    info "apply sysctl: ${out}"
+    return
+  fi
+  # sysctl -w exits 0 when the write fails with EROFS or EPERM, so read the value back
+  out=$(sysctl -q -w "$1=1" 2>&1)
+  if [ "$(sysctl -n "$1" 2>/dev/null)" = 1 ]; then
+    info "apply sysctl: $1 = 1"
   else
     error "failed to enable $1 (${out}), run the container with --privileged, or set it with --sysctl $1=1 (not available with the host network)."
   fi
