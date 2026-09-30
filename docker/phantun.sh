@@ -21,12 +21,8 @@ error() {
   printf "${red}[${time}] [ERROR]: ${clear}%s\n" "$*" >&2
 }
 
-# bash does not expand aliases in scripts, so pick the backend binaries by name
-if [ "$USE_IPTABLES_NFT_BACKEND" = 1 ]; then
-  IPTABLES_BACKEND=nft
-else
-  IPTABLES_BACKEND=legacy
-fi
+# The phantun binaries. phantun-server and phantun-client in PATH are links to this script.
+PHANTUN_BIN_DIR=/usr/local/libexec/phantun
 
 _is_server_mode() {
   [ "${1##*/}" = "phantun-server" ]
@@ -101,15 +97,6 @@ _get_peer() {
   fi
 }
 
-# the first unused tunN, which is what the kernel picks when phantun gets an empty --tun
-_next_tun() {
-  local n=0
-  while [ -e "/sys/class/net/tun${n}" ]; do
-    n=$((n + 1))
-  done
-  echo "tun${n}"
-}
-
 # _get_default_iface <4|6>
 _get_default_iface() {
   ip -"$1" route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
@@ -122,6 +109,38 @@ _get_addr_by_iface() {
 
 _ipt_name() {
   [ "$1" = 6 ] && echo ip6tables || echo iptables
+}
+
+# USE_IPTABLES_NFT_BACKEND=1 selects iptables-nft and 0 iptables-legacy. Otherwise, pick the one
+# that holds more rules, which is the one a host sharing its network uses, and nft on a tie unless
+# the kernel lacks nf_tables.
+select_iptables_backend() {
+  local nft legacy
+  case "$USE_IPTABLES_NFT_BACKEND" in
+    1)
+      IPTABLES_BACKEND=nft
+      return
+      ;;
+    0)
+      IPTABLES_BACKEND=legacy
+      return
+      ;;
+  esac
+
+  if ! iptables-nft -w 10 -S >/dev/null 2>&1; then
+    IPTABLES_BACKEND=legacy
+    info "iptables backend: legacy, nf_tables is not available."
+    return
+  fi
+
+  nft=$({ iptables-nft-save; ip6tables-nft-save; } 2>/dev/null | grep -c '^-A')
+  legacy=$({ iptables-legacy-save; ip6tables-legacy-save; } 2>/dev/null | grep -c '^-A')
+  if [ "$legacy" -gt "$nft" ]; then
+    IPTABLES_BACKEND=legacy
+  else
+    IPTABLES_BACKEND=nft
+  fi
+  info "iptables backend: ${IPTABLES_BACKEND}, found ${nft} nft and ${legacy} legacy rules."
 }
 
 # _ipt <4|6> <iptables args...>
@@ -181,19 +200,20 @@ apply_rules() {
     return
   fi
 
-  _ipt "$family" -A FORWARD -i "$TUN" -j ACCEPT -m comment --comment "$COMMENT" || error "${name} filter rule add failed."
-  _ipt "$family" -A FORWARD -o "$TUN" -j ACCEPT -m comment --comment "$COMMENT" || error "${name} filter rule add failed."
+  # insert rather than append, so that rejecting rules at the end of the host's chains do not win
+  _ipt "$family" -I FORWARD -i "$TUN" -j ACCEPT -m comment --comment "$COMMENT" || error "${name} filter rule add failed."
+  _ipt "$family" -I FORWARD -o "$TUN" -j ACCEPT -m comment --comment "$COMMENT" || error "${name} filter rule add failed."
 
   if _is_server_mode "$1"; then
     local address=$(_get_addr_by_iface "$family" "$interface")
-    if _ipt "$family" -t nat -A PREROUTING -p tcp -i "$interface" --dport "$PORT" -j DNAT --to-destination "$peer" \
+    if _ipt "$family" -t nat -I PREROUTING -p tcp -i "$interface" --dport "$PORT" -j DNAT --to-destination "$peer" \
       -m comment --comment "$COMMENT"; then
       info "${name} DNAT rule added: [${COMMENT}]: ${interface} -> ${TUN}, ${address} -> ${peer}"
     else
       error "${name} DNAT rule add failed."
     fi
   else
-    if _ipt "$family" -t nat -A POSTROUTING -s "$peer" -o "$interface" -j MASQUERADE \
+    if _ipt "$family" -t nat -I POSTROUTING -s "$peer" -o "$interface" -j MASQUERADE \
       -m comment --comment "$COMMENT"; then
       info "${name} MASQUERADE rule added: [${COMMENT}]: ${TUN} -> ${interface} (peer ${peer})"
     else
@@ -235,21 +255,37 @@ cleanup() {
 }
 
 start_phantun() {
-  if ! _is_phantun "$1" || _has_arg -h "$@" || _has_arg --help "$@" || _has_arg -V "$@" || _has_arg --version "$@"; then
+  if ! _is_phantun "$1"; then
+    exec "$@"
+  fi
+  # run the binary rather than the link in PATH, which leads back here
+  if [ -x "${PHANTUN_BIN_DIR}/${1##*/}" ]; then
+    set -- "${PHANTUN_BIN_DIR}/${1##*/}" "${@:2}"
+  fi
+  if _has_arg -h "$@" || _has_arg --help "$@" || _has_arg -V "$@" || _has_arg --version "$@"; then
     exec "$@"
   fi
 
-  TUN=$(_get_opt tun "" "$@")
-  if [ -z "$TUN" ]; then
-    # pin the name down so the rules match the interface phantun actually creates
-    TUN=$(_next_tun)
-    set -- "$@" --tun "$TUN"
-  fi
   local address=$(_get_opt local l "$@")
   PORT=${address##*:}
+  TUN=$(_get_opt tun "" "$@")
+  if [ -z "$TUN" ]; then
+    # Pin the name down so the rules match the interface phantun creates, and derive it from the
+    # port, so it is the same after a restart and differs between instances started together.
+    _is_server_mode "$1" && TUN="phantun-s${PORT}" || TUN="phantun-c${PORT}"
+    set -- "$@" --tun "$TUN"
+  fi
+  # The kernel lets phantun attach to an existing tun interface, which would then be shared with
+  # whatever created it
+  if [ -e "/sys/class/net/${TUN}" ]; then
+    error "interface ${TUN} already exists, is another phantun running with it? Pick another one with --tun."
+    exit 1
+  fi
   # iptables-save quotes comments with other characters, which would break matching them
   COMMENT="phantun_${TUN}_${PORT}"
   COMMENT=${COMMENT//[^A-Za-z0-9_-]/_}
+
+  select_iptables_backend
 
   # Signals only make the script exit and the EXIT trap does the cleanup, so the rules are also
   # removed when phantun exits on its own or a signal arrives before phantun is started.
@@ -272,5 +308,11 @@ start_phantun() {
   warn "phantun exited with code ${code}."
   return $code
 }
+
+# Run through the phantun-server or phantun-client link, e.g. by a runtime such as RouterOS, which
+# runs the command directly rather than as arguments of the entrypoint
+if _is_phantun "$0"; then
+  set -- "$0" "$@"
+fi
 
 start_phantun "$@"

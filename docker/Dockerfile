@@ -38,11 +38,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/bin/phantun-server /usr/local/bin/
-COPY --from=builder /usr/local/bin/phantun-client /usr/local/bin/
+COPY --from=builder /usr/local/bin/phantun-server /usr/local/bin/phantun-client /usr/local/libexec/phantun/
 COPY docker/phantun.sh /usr/local/bin/
+# The commands run phantun.sh, so the sysctls and iptables rules are also set up when a runtime
+# such as RouterOS runs the command directly rather than through the entrypoint
+RUN ln -s phantun.sh /usr/local/bin/phantun-server \
+    && ln -s phantun.sh /usr/local/bin/phantun-client
 
-ENV USE_IPTABLES_NFT_BACKEND=1
 ENV RUST_LOG=info
 
 ENTRYPOINT ["phantun.sh"]
