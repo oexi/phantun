@@ -195,7 +195,7 @@ async fn main() -> io::Result<()> {
 
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
-            let fec = fec_config.map(|c| Arc::new(Fec::new(c)));
+            let fec = fec_config.map(|c| Arc::new(Fec::new(c, sock.to_string())));
 
             if let Some(ref fec) = fec {
                 let sock = sock.clone();

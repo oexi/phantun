@@ -30,6 +30,7 @@
 use clap::{Arg, ArgMatches, value_parser};
 use fake_tcp::Socket;
 use fake_tcp::packet::MAX_PACKET_LEN;
+use log::{info, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -68,9 +69,14 @@ const MAX_TIMEOUT_MS: u64 = 1000;
 /// Longest time in milliseconds parity shards may be spread over, far longer than any burst worth
 /// riding out
 const MAX_INTERVAL_MS: u64 = 1000;
+/// Longest time in seconds between two statistics reports of a connection
+const MAX_STATS_SECS: u64 = 86400;
+/// Number of frames that are not FEC frames, without a single FEC data shard, after which the peer
+/// is assumed not to use FEC. More than one, as the peer may send a handshake packet.
+const MISMATCH_FRAMES: u64 = 3;
 
 /// Command line arguments configuring FEC, shared by the client and the server
-pub fn args() -> [Arg; 3] {
+pub fn args() -> [Arg; 4] {
     [
         Arg::new("fec")
             .long("fec")
@@ -101,6 +107,16 @@ pub fn args() -> [Arg; 3] {
                    to take out a whole group. The first parity packet is still sent right away, \
                    but recovery from a burst may be delayed by up to this much. 0 disables, at most 1000")
             .default_value("0"),
+        Arg::new("fec_stats")
+            .long("fec-stats")
+            .required(false)
+            .value_name("SECS")
+            .value_parser(value_parser!(u64).range(0..=MAX_STATS_SECS))
+            .requires("fec")
+            .help("Logs how many packets of each connection were sent, received, recovered and lost \
+                   every this many seconds, and when the connection closes. 0 only logs them when \
+                   the connection closes")
+            .default_value("300"),
     ]
 }
 
@@ -129,19 +145,22 @@ pub struct FecConfig {
     pub timeout: Duration,
     /// Time over which the parity shards of a group are spread out, zero sends them back to back
     pub interval: Duration,
+    /// Time between two statistics reports, zero only reports them when the connection closes
+    pub stats_interval: Duration,
 }
 
 impl FecConfig {
     /// Reads the configuration from the arguments of [`args`], `None` if FEC is not enabled
     pub fn from_matches(matches: &ArgMatches) -> Option<FecConfig> {
         let &(data_shards, parity_shards) = matches.get_one::<(usize, usize)>("fec")?;
-        let millis = |id| Duration::from_millis(*matches.get_one::<u64>(id).unwrap());
+        let value = |id| *matches.get_one::<u64>(id).unwrap();
 
         Some(FecConfig {
             data_shards,
             parity_shards,
-            timeout: millis("fec_timeout"),
-            interval: millis("fec_interval"),
+            timeout: Duration::from_millis(value("fec_timeout")),
+            interval: Duration::from_millis(value("fec_interval")),
+            stats_interval: Duration::from_secs(value("fec_stats")),
         })
     }
 }
@@ -153,6 +172,80 @@ impl fmt::Display for FecConfig {
             "{}:{}, timeout {:?}, parity spread over {:?}",
             self.data_shards, self.parity_shards, self.timeout, self.interval
         )
+    }
+}
+
+/// Packet counters of a connection
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Stats {
+    sent_data: u64,
+    sent_parity: u64,
+    /// Data and parity shards received, not counting duplicates
+    received_data: u64,
+    received_parity: u64,
+    /// Lost data shards recovered from parity shards
+    recovered: u64,
+    /// Lost data shards that could not be recovered. Losses at the end of a group are only known
+    /// once a parity shard of the group was received.
+    lost: u64,
+    /// Parity shards that arrived after their group was forgotten
+    late_parity: u64,
+    /// Frames that are not FEC frames
+    invalid: u64,
+}
+
+impl Stats {
+    /// Counters since `earlier`
+    fn since(&self, earlier: &Stats) -> Stats {
+        Stats {
+            sent_data: self.sent_data - earlier.sent_data,
+            sent_parity: self.sent_parity - earlier.sent_parity,
+            received_data: self.received_data - earlier.received_data,
+            received_parity: self.received_parity - earlier.received_parity,
+            recovered: self.recovered - earlier.recovered,
+            lost: self.lost - earlier.lost,
+            late_parity: self.late_parity - earlier.late_parity,
+            invalid: self.invalid - earlier.invalid,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Stats::default()
+    }
+}
+
+impl fmt::Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "sent {} data + {} parity packets, received {} data + {} parity packets, \
+             recovered {} and lost {} data packets",
+            self.sent_data,
+            self.sent_parity,
+            self.received_data,
+            self.received_parity,
+            self.recovered,
+            self.lost
+        )?;
+
+        let data = self.received_data + self.recovered + self.lost;
+        if data > 0 {
+            let percent = |n| n as f64 * 100.0 / data as f64;
+            write!(
+                f,
+                " ({:.2}% loss before FEC, {:.3}% after)",
+                percent(self.recovered + self.lost),
+                percent(self.lost)
+            )?;
+        }
+        if self.late_parity > 0 {
+            write!(f, ", {} late parity packets", self.late_parity)?;
+        }
+        if self.invalid > 0 {
+            write!(f, ", {} invalid packets", self.invalid)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -279,6 +372,8 @@ struct Encoder {
     /// Data shards of the current group, not padded yet
     shards: Vec<Vec<u8>>,
     started: Option<Instant>,
+    /// Only the sent counters are used
+    stats: Stats,
 }
 
 impl Encoder {
@@ -292,6 +387,7 @@ impl Encoder {
             group: rand::random(),
             shards: Vec::with_capacity(config.data_shards),
             started: None,
+            stats: Stats::default(),
         }
     }
 
@@ -302,6 +398,7 @@ impl Encoder {
         buf[1..5].copy_from_slice(&self.group.to_be_bytes());
         buf[5] = self.shards.len() as u8;
         self.shards.push(data_shard(&buf[HEADROOM..]));
+        self.stats.sent_data += 1;
 
         if self.started.is_none() {
             self.started = Some(now);
@@ -342,6 +439,7 @@ impl Encoder {
         };
         self.group = self.group.wrapping_add(1);
         self.started = None;
+        self.stats.sent_parity += m as u64;
 
         group
     }
@@ -417,6 +515,25 @@ impl Group {
         self.data = Vec::new();
         self.parity = Vec::new();
     }
+
+    /// Number of data shards that are missing for good once the group is forgotten
+    fn lost(&self) -> usize {
+        if self.done {
+            return 0;
+        }
+
+        let k = match self.params {
+            Some((k, _)) => k,
+            // without parity shards, only the data shards before the last one received are known
+            None => self
+                .data
+                .iter()
+                .map(|&(i, _)| i as usize + 1)
+                .max()
+                .unwrap_or(0),
+        };
+        k.saturating_sub(self.data.len())
+    }
 }
 
 /// Whether groups `a` and `b` are less than `MAX_GROUPS` apart, accounting for wrap-around
@@ -433,6 +550,10 @@ struct Decoder {
     /// track of
     far: Option<(u32, u8, Vec<u8>)>,
     codecs: Codecs,
+    /// Only the received counters are used
+    stats: Stats,
+    /// Whether it has been reported that the peer does not seem to use FEC
+    mismatch_reported: bool,
 }
 
 impl Default for Decoder {
@@ -442,11 +563,33 @@ impl Default for Decoder {
             newest: None,
             far: None,
             codecs: Codecs::default(),
+            stats: Stats::default(),
+            mismatch_reported: false,
         }
     }
 }
 
 impl Decoder {
+    /// Stores `group` in `slot`, forgetting the group it held
+    fn replace(&mut self, slot: usize, group: Option<Group>) {
+        if let Some(forgotten) = std::mem::replace(&mut self.slots[slot], group) {
+            self.stats.lost += forgotten.lost() as u64;
+        }
+    }
+
+    /// Returns `true` once, when the peer does not seem to use FEC
+    fn mismatch(&mut self) -> bool {
+        if self.mismatch_reported
+            || self.stats.received_data > 0
+            || self.stats.invalid < MISMATCH_FRAMES
+        {
+            return false;
+        }
+
+        self.mismatch_reported = true;
+        true
+    }
+
     /// Returns the slot of group `id`, or `None` if it is too far from the recent groups to keep
     /// track of. Groups are tracked relative to the newest one, so a late parity shard of a
     /// forgotten group can neither take the place of a recent group, nor recover datagrams that
@@ -463,7 +606,7 @@ impl Decoder {
         // the slot holds either this group, or one that is no longer recent
         let slot = id as usize % MAX_GROUPS;
         if self.slots[slot].as_ref().is_none_or(|g| g.id != id) {
-            self.slots[slot] = Some(Group::new(id));
+            self.replace(slot, Some(Group::new(id)));
         }
 
         Some(slot)
@@ -482,7 +625,9 @@ impl Decoder {
 
         match self.far.take() {
             Some((far, far_index, far_shard)) if near(far, id) => {
-                self.slots.fill_with(|| None);
+                for slot in 0..MAX_GROUPS {
+                    self.replace(slot, None);
+                }
                 self.newest = Some(id);
                 // it was forwarded already, so it must not be recovered again
                 let slot = self.slot(far).unwrap();
@@ -501,6 +646,7 @@ impl Decoder {
     /// `frame` is a new data shard, and the group if lost data shards can now be recovered.
     fn feed<'a>(&mut self, frame: &'a [u8]) -> (Option<&'a [u8]>, Option<Recovery>) {
         if frame.len() < HEADROOM {
+            self.stats.invalid += 1;
             return (None, None);
         }
 
@@ -512,6 +658,7 @@ impl Decoder {
                 let payload = &frame[HEADROOM..];
                 let Some(slot) = self.data_slot(id, index, payload) else {
                     // FEC can not help with this one, but it is still worth forwarding
+                    self.stats.received_data += 1;
                     return (Some(payload), None);
                 };
                 let group = self.slots[slot].as_mut().unwrap();
@@ -520,24 +667,32 @@ impl Decoder {
                 }
 
                 group.data.push((index, data_shard(payload)));
+                self.stats.received_data += 1;
                 (Some(payload), self.recovery(slot))
             }
             TYPE_PARITY => {
                 if frame.len() < PARITY_HEADER_LEN + LEN_PREFIX {
+                    self.stats.invalid += 1;
                     return (None, None);
                 }
                 let (k, m) = (frame[6] as usize, frame[7] as usize);
                 if k == 0 || m == 0 || (index as usize) < k || index as usize >= k + m {
+                    self.stats.invalid += 1;
                     return (None, None);
                 }
 
                 let parity = &frame[PARITY_HEADER_LEN..];
                 let Some(slot) = self.slot(id) else {
+                    self.stats.late_parity += 1;
                     return (None, None);
                 };
                 let group = self.slots[slot].as_mut().unwrap();
-                if group.done
-                    || group.params.is_some_and(|p| p != (k, m))
+                if group.done {
+                    // no longer needed, e.g. as no data shard was lost, but it did arrive
+                    self.stats.received_parity += 1;
+                    return (None, None);
+                }
+                if group.params.is_some_and(|p| p != (k, m))
                     || group
                         .parity
                         .iter()
@@ -548,9 +703,13 @@ impl Decoder {
 
                 group.params = Some((k, m));
                 group.parity.push((index, parity.to_vec()));
+                self.stats.received_parity += 1;
                 (None, self.recovery(slot))
             }
-            _ => (None, None),
+            _ => {
+                self.stats.invalid += 1;
+                (None, None)
+            }
         }
     }
 
@@ -572,6 +731,7 @@ impl Decoder {
         let data = std::mem::take(&mut group.data);
         let parity = std::mem::take(&mut group.parity);
         group.close();
+        self.stats.recovered += (k - data.len()) as u64;
 
         Some(Recovery {
             data,
@@ -627,33 +787,53 @@ impl Recovery {
 
 /// FEC state of a single fake TCP connection, shared by all of its worker tasks.
 pub struct Fec {
+    /// The connection, for logging
+    name: String,
     encoder: Mutex<Encoder>,
     decoder: Mutex<Decoder>,
     pacer: Mutex<Pacer>,
     interval: Duration,
+    stats_interval: Duration,
     /// Wakes the flusher when a group starts or parity shards are queued
     wake: Notify,
 }
 
 impl Fec {
-    pub fn new(config: FecConfig) -> Fec {
+    /// Creates the FEC state of the connection `name`, which is only used for logging.
+    pub fn new(config: FecConfig, name: String) -> Fec {
         Fec {
+            name,
             encoder: Mutex::new(Encoder::new(config)),
             decoder: Mutex::new(Decoder::default()),
             pacer: Mutex::new(Pacer::default()),
             interval: config.interval,
+            stats_interval: config.stats_interval,
             wake: Notify::new(),
         }
     }
 
+    fn stats(&self) -> Stats {
+        let sent = self.encoder.lock().unwrap().stats;
+        let received = self.decoder.lock().unwrap().stats;
+        Stats {
+            sent_data: sent.sent_data,
+            sent_parity: sent.sent_parity,
+            ..received
+        }
+    }
+
     /// Sends parity shards of groups that have not been filled within the timeout, and parity
-    /// shards that were spread out once they are due. Returns once `sock` fails.
+    /// shards that were spread out once they are due, and logs statistics periodically. Returns
+    /// once `sock` fails.
     pub async fn run_flusher(&self, sock: &Socket) {
         let mut out = Vec::new();
+        let mut reported = Stats::default();
+        let mut next_report =
+            (!self.stats_interval.is_zero()).then(|| Instant::now() + self.stats_interval);
         loop {
             let deadline = self.encoder.lock().unwrap().deadline();
             let due = self.pacer.lock().unwrap().next();
-            match deadline.into_iter().chain(due).min() {
+            match deadline.into_iter().chain(due).chain(next_report).min() {
                 // a group closing or parity being queued may need an earlier wake up
                 Some(next) => tokio::select! {
                     _ = time::sleep_until(next.into()) => {}
@@ -672,6 +852,19 @@ impl Fec {
                 if sock.send(&p).await.is_none() {
                     return;
                 }
+            }
+
+            if next_report.is_some_and(|t| t <= now) {
+                let stats = self.stats();
+                let period = stats.since(&reported);
+                if !period.is_empty() {
+                    info!(
+                        "FEC stats of {} in the last {:?}: {}",
+                        self.name, self.stats_interval, period
+                    );
+                }
+                reported = stats;
+                next_report = Some(now + self.stats_interval);
             }
         }
     }
@@ -697,6 +890,16 @@ impl Fec {
         self.wake.notify_one();
 
         send_now
+    }
+}
+
+impl Drop for Fec {
+    /// Logs the statistics of the whole connection once it is closed
+    fn drop(&mut self) {
+        let stats = self.stats();
+        if !stats.is_empty() {
+            info!("FEC stats of {} in total: {}", self.name, stats);
+        }
     }
 }
 
@@ -743,7 +946,18 @@ pub async fn forward_to_udp(
         return Ok(());
     };
 
-    let (datagram, recovery) = fec.decoder.lock().unwrap().feed(frame);
+    let (datagram, recovery) = {
+        let mut decoder = fec.decoder.lock().unwrap();
+        let decoded = decoder.feed(frame);
+        if decoder.mismatch() {
+            warn!(
+                "{} received {} packets that are not FEC frames and no FEC data packet, \
+                 is --fec enabled on the peer?",
+                fec.name, decoder.stats.invalid
+            );
+        }
+        decoded
+    };
     if let Some(datagram) = datagram {
         udp_sock.send(datagram).await?;
     }
@@ -767,6 +981,7 @@ mod tests {
             parity_shards: m,
             timeout: Duration::from_millis(10),
             interval: Duration::ZERO,
+            stats_interval: Duration::ZERO,
         }
     }
 
@@ -836,15 +1051,24 @@ mod tests {
                 parity_shards: 3,
                 timeout: Duration::from_millis(8),
                 interval: Duration::ZERO,
+                stats_interval: Duration::from_secs(300),
             })
         );
         assert_eq!(
-            parse_args(&["--fec=20:2", "--fec-timeout", "0", "--fec-interval=1000"]).unwrap(),
+            parse_args(&[
+                "--fec=20:2",
+                "--fec-timeout",
+                "0",
+                "--fec-interval=1000",
+                "--fec-stats=0"
+            ])
+            .unwrap(),
             Some(FecConfig {
                 data_shards: 20,
                 parity_shards: 2,
                 timeout: Duration::ZERO,
                 interval: Duration::from_secs(1),
+                stats_interval: Duration::ZERO,
             })
         );
 
@@ -856,9 +1080,11 @@ mod tests {
             &["--fec", "10:3", "--fec-timeout", "1001"],
             &["--fec", "10:3", "--fec-interval", "1001"],
             &["--fec", "10:3", "--fec-interval", "-1"],
-            // timing options without --fec
+            &["--fec", "10:3", "--fec-stats", "86401"],
+            // other options without --fec
             &["--fec-timeout", "8"],
             &["--fec-interval", "20"],
+            &["--fec-stats", "60"],
         ] {
             assert!(parse_args(bad).is_err(), "{bad:?}");
         }
@@ -883,7 +1109,7 @@ mod tests {
 
     #[test]
     fn parity_back_to_back_without_interval() {
-        let fec = Fec::new(config(10, 3));
+        let fec = Fec::new(config(10, 3), "test".into());
         let now = Instant::now();
         assert_eq!(fec.schedule(fake_parity(0, 3), now), fake_parity(0, 3));
         assert_eq!(fec.pacer.lock().unwrap().next(), None);
@@ -891,10 +1117,13 @@ mod tests {
 
     #[test]
     fn parity_spread_over_interval() {
-        let fec = Fec::new(FecConfig {
-            interval: Duration::from_millis(20),
-            ..config(10, 3)
-        });
+        let fec = Fec::new(
+            FecConfig {
+                interval: Duration::from_millis(20),
+                ..config(10, 3)
+            },
+            "test".into(),
+        );
         let ms = Duration::from_millis;
         let t0 = Instant::now();
 
@@ -918,10 +1147,13 @@ mod tests {
 
     #[test]
     fn bounded_pending_parity() {
-        let fec = Fec::new(FecConfig {
-            interval: Duration::from_millis(20),
-            ..config(1, 2)
-        });
+        let fec = Fec::new(
+            FecConfig {
+                interval: Duration::from_millis(20),
+                ..config(1, 2)
+            },
+            "test".into(),
+        );
         let now = Instant::now();
         let mut sent_now = 0;
         for g in 0..=MAX_PENDING_PARITY {
@@ -1270,5 +1502,94 @@ mod tests {
                 .map(|(_, f)| f),
         );
         assert_eq!(sorted(delivered), sorted(datagrams));
+    }
+
+    #[test]
+    fn statistics() {
+        let mut encoder = Encoder::new(config(10, 3));
+        let mut decoder = Decoder::default();
+
+        // 1: 3 data shards lost and recovered
+        // 2: 4 data shards lost for good, which its parity shards tell
+        // 3: 3 data shards and all parity shards lost, of which 2 data shards are known
+        // 4: nothing lost, so the parity shards are not needed
+        let (old, _) = groups(&mut encoder, 4, 10);
+        let lost = [0, 1, 2, 13, 14, 15, 16, 26, 28, 35, 36, 37, 38];
+        let frames = old.iter().enumerate().filter(|(i, _)| !lost.contains(i));
+        decode(&mut decoder, frames.map(|(_, f)| f));
+
+        // the peer moves on, which forgets all of them
+        encoder.group = encoder.group.wrapping_add(MAX_GROUPS as u32 * 2);
+        let (new, _) = groups(&mut encoder, 1, 10);
+        decode(&mut decoder, new[..2].iter());
+
+        // a late parity shard, a duplicate and a packet that is not a FEC frame
+        let delivered = decode(&mut decoder, [&old[36], &new[1], &vec![4; 32]].into_iter());
+        assert!(delivered.is_empty());
+
+        assert_eq!(
+            encoder.stats,
+            Stats {
+                sent_data: 50,
+                sent_parity: 15,
+                ..Stats::default()
+            }
+        );
+        assert_eq!(
+            decoder.stats,
+            Stats {
+                received_data: 7 + 6 + 7 + 10 + 2,
+                received_parity: 3 + 3 + 3,
+                recovered: 3,
+                lost: 4 + 2,
+                late_parity: 1,
+                invalid: 1,
+                ..Stats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn statistics_report() {
+        let stats = Stats {
+            sent_data: 1000,
+            sent_parity: 300,
+            received_data: 990,
+            received_parity: 297,
+            recovered: 9,
+            lost: 1,
+            late_parity: 0,
+            invalid: 2,
+        };
+        assert_eq!(
+            stats.to_string(),
+            "sent 1000 data + 300 parity packets, received 990 data + 297 parity packets, \
+             recovered 9 and lost 1 data packets (1.00% loss before FEC, 0.100% after), \
+             2 invalid packets"
+        );
+        assert_eq!(stats.since(&stats), Stats::default());
+        assert!(stats.since(&stats).is_empty());
+    }
+
+    #[test]
+    fn peer_without_fec() {
+        // WireGuard packets start with their type, 1 to 4, followed by 3 zero bytes
+        let mut decoder = Decoder::default();
+        let mut mismatch = 0;
+        for i in 0..20u8 {
+            let mut packet = vec![1 + i % 4, 0, 0, 0];
+            packet.extend((0..60).map(|b| b ^ i));
+            feed(&mut decoder, &packet, &mut Vec::new());
+            mismatch += decoder.mismatch() as usize;
+        }
+        assert_eq!(mismatch, 1);
+
+        // a handshake packet in front of FEC frames is fine
+        let mut decoder = Decoder::default();
+        let (frames, _) = groups(&mut Encoder::new(config(10, 3)), 3, 10);
+        for f in std::iter::once(&vec![0x16; 3]).chain(frames.iter()) {
+            feed(&mut decoder, f, &mut Vec::new());
+            assert!(!decoder.mismatch());
+        }
     }
 }

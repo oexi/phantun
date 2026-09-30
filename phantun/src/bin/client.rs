@@ -213,7 +213,7 @@ async fn main() -> io::Result<()> {
                 debug!("Sent handshake packet to: {}", sock);
             }
 
-            let fec = fec_config.map(|c| Arc::new(Fec::new(c)));
+            let fec = fec_config.map(|c| Arc::new(Fec::new(c, sock.to_string())));
 
             // send first packet
             if fec::send_datagram(&sock, fec.as_deref(), &mut buf_r[..HEADROOM + size])
