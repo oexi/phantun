@@ -1,4 +1,4 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
@@ -223,9 +223,10 @@ async fn main() -> io::Result<()> {
     info!("Created TUN device {}", tun[0].name());
 
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
-    let connections = Arc::new(RwLock::new(
-        HashMap::<SocketAddr, (Arc<Socket>, Option<Arc<Fec>>)>::new(),
-    ));
+    let connections = Arc::new(RwLock::new(HashMap::<
+        SocketAddr,
+        (Arc<Socket>, Option<Arc<Fec>>),
+    >::new()));
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
 
@@ -271,11 +272,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            assert!(connections
-                .write()
-                .await
-                .insert(udp_remote_addr, (sock.clone(), fec.clone()))
-                .is_none());
+            assert!(
+                connections
+                    .write()
+                    .await
+                    .insert(udp_remote_addr, (sock.clone(), fec.clone()))
+                    .is_none()
+            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -316,10 +319,7 @@ async fn main() -> io::Result<()> {
                     // connect to (<incoming packet src_ip>, <incoming packet src_port>).
                     let bind_addr = match (udp_remote_addr, udp_local_addr) {
                         (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
+                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
                         }
                         (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
                             SocketAddr::V6(SocketAddrV6::new(
@@ -330,7 +330,9 @@ async fn main() -> io::Result<()> {
                             ))
                         }
                         (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                            panic!(
+                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                            );
                         }
                     };
                     let udp_sock = new_udp_reuseport(bind_addr);

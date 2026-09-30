@@ -45,14 +45,14 @@ pub mod packet;
 use bytes::{Bytes, BytesMut};
 use log::{error, info, trace, warn};
 use packet::*;
-use pnet::packet::{tcp, Packet};
+use pnet::packet::{Packet, tcp};
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc, RwLock,
+    atomic::{AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;

@@ -1,6 +1,6 @@
-use clap::{crate_version, Arg, ArgAction, Command};
-use fake_tcp::packet::MAX_PACKET_LEN;
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::Stack;
+use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
 use phantun::fec::{self, Fec, FecConfig, HEADROOM};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
