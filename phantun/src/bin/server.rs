@@ -327,6 +327,7 @@ async fn main() -> io::Result<()> {
                             quit.cancel();
                             return;
                         },
+                        _ = quit.cancelled() => return,
                         _ = packet_received_fut => {},
                     }
                 }
