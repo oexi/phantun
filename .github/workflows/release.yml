@@ -3,6 +3,8 @@ on:
   push:
     tags:
       - v*.*.*
+  # builds every target without publishing anything
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,16 +30,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-      - uses: actions-rs/cargo@v1
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
         with:
-          use-cross: true
-          command: build
-          args: --release --target ${{ matrix.target }}
+          tool: cross
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
       - name: Rename artifacts and compress
         run: |
           cd target/${{ matrix.target }}/release
@@ -46,6 +46,7 @@ jobs:
           zip phantun_${{ matrix.target }}.zip phantun_client phantun_server
 
       - name: Upload Github Assets
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: target/${{ matrix.target }}/release/*.zip
@@ -65,16 +66,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
-          override: true
           components: rust-src
-      - uses: actions-rs/cargo@v1
+      - uses: taiki-e/install-action@v2
         with:
-          use-cross: true
-          command: build
-          args: --release --target ${{ matrix.target }} -Z build-std
+          tool: cross
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }} -Z build-std
       - name: Rename artifacts and compress
         run: |
           cd target/${{ matrix.target }}/release
@@ -83,6 +82,7 @@ jobs:
           zip phantun_${{ matrix.target }}_nightly.zip phantun_client phantun_server
 
       - name: Upload Github Assets
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: target/${{ matrix.target }}/release/*.zip
