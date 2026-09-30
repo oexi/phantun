@@ -24,3 +24,8 @@ tokio = { workspace = true }
 log = { workspace = true }
 reed-solomon-erasure = "6"
 rand = "0"
+
+# The SIMD code is only built for x86_64 and aarch64, and on x86_64 it requires AVX2, which older
+# CPUs lack
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
