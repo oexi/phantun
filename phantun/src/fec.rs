@@ -31,7 +31,7 @@ use clap::{Arg, ArgMatches, value_parser};
 use fake_tcp::Socket;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::io;
 use std::sync::Mutex;
@@ -49,8 +49,10 @@ const LEN_PREFIX: usize = 2;
 /// Extra bytes FEC adds on top of the largest datagram, which is the size of a parity shard header
 /// plus the length prefix
 pub const MTU_OVERHEAD: usize = PARITY_HEADER_LEN + LEN_PREFIX;
-/// Number of recent groups the decoder keeps track of
+/// Number of recent groups the decoder keeps track of, a power of two so that group numbers keep
+/// mapping to the same slot when they wrap around
 const MAX_GROUPS: usize = 256;
+const _: () = assert!(MAX_GROUPS.is_power_of_two());
 const MAX_CODECS: usize = 64;
 /// Fraction of data shards that may stay unrecovered, used to find the loss rate a `K:M`
 /// ratio is meant for, and the parity shards smaller groups need to cope with it
@@ -266,7 +268,9 @@ impl Encoder {
         Encoder {
             config,
             parity: parity_table(config.data_shards, config.parity_shards),
-            group: 0,
+            // a random start makes it unlikely that anything else the peer receives, such as a
+            // handshake packet, passes for a shard of a recent group
+            group: rand::random(),
             shards: Vec::with_capacity(config.data_shards),
             started: None,
             codecs: Codecs::default(),
@@ -353,8 +357,8 @@ impl Encoder {
     }
 }
 
-#[derive(Default)]
 struct Group {
+    id: u32,
     /// `(k, m)`, known once a parity shard has been received
     params: Option<(usize, usize)>,
     data: Vec<(u8, Vec<u8>)>,
@@ -363,6 +367,16 @@ struct Group {
 }
 
 impl Group {
+    fn new(id: u32) -> Group {
+        Group {
+            id,
+            params: None,
+            data: Vec::new(),
+            parity: Vec::new(),
+            done: false,
+        }
+    }
+
     fn close(&mut self) {
         self.done = true;
         self.data = Vec::new();
@@ -370,25 +384,82 @@ impl Group {
     }
 }
 
-#[derive(Default)]
+/// Whether groups `a` and `b` are less than `MAX_GROUPS` apart, accounting for wrap-around
+fn near(a: u32, b: u32) -> bool {
+    (b.wrapping_sub(a) as i32).unsigned_abs() < MAX_GROUPS as u32
+}
+
 struct Decoder {
-    groups: HashMap<u32, Group>,
-    order: VecDeque<u32>,
+    /// Recent groups by group number modulo `MAX_GROUPS`
+    slots: Vec<Option<Group>>,
+    /// Newest group seen, those `MAX_GROUPS` or more before it are forgotten
+    newest: Option<u32>,
+    /// `(group, index, datagram)` of the last data shard too far from the recent groups to keep
+    /// track of
+    far: Option<(u32, u8, Vec<u8>)>,
     codecs: Codecs,
 }
 
+impl Default for Decoder {
+    fn default() -> Decoder {
+        Decoder {
+            slots: std::iter::repeat_with(|| None).take(MAX_GROUPS).collect(),
+            newest: None,
+            far: None,
+            codecs: Codecs::default(),
+        }
+    }
+}
+
 impl Decoder {
-    fn group(&mut self, id: u32) -> &mut Group {
-        if !self.groups.contains_key(&id) {
-            if self.order.len() >= MAX_GROUPS
-                && let Some(oldest) = self.order.pop_front()
-            {
-                self.groups.remove(&oldest);
-            }
-            self.order.push_back(id);
+    /// Returns the slot of group `id`, or `None` if it is too far from the recent groups to keep
+    /// track of. Groups are tracked relative to the newest one, so a late parity shard of a
+    /// forgotten group can neither take the place of a recent group, nor recover datagrams that
+    /// were already delivered.
+    fn slot(&mut self, id: u32) -> Option<usize> {
+        let newest = *self.newest.get_or_insert(id);
+        if !near(newest, id) {
+            return None;
+        }
+        if (id.wrapping_sub(newest) as i32) > 0 {
+            self.newest = Some(id);
         }
 
-        self.groups.entry(id).or_default()
+        // the slot holds either this group, or one that is no longer recent
+        let slot = id as usize % MAX_GROUPS;
+        if self.slots[slot].as_ref().is_none_or(|g| g.id != id) {
+            self.slots[slot] = Some(Group::new(id));
+        }
+
+        Some(slot)
+    }
+
+    /// Returns the slot of the group of a data shard, like [`Decoder::slot`].
+    ///
+    /// A data shard far from the recent groups is either stray, or the peer moved on after more
+    /// than `MAX_GROUPS` groups were lost in a row. As the peer never delays data shards, the
+    /// latter is assumed once the next data shard is close to it, and the decoder starts over.
+    fn data_slot(&mut self, id: u32, index: u8, datagram: &[u8]) -> Option<usize> {
+        if let Some(slot) = self.slot(id) {
+            self.far = None;
+            return Some(slot);
+        }
+
+        match self.far.take() {
+            Some((far, far_index, far_datagram)) if near(far, id) => {
+                self.slots.fill_with(|| None);
+                self.newest = Some(id);
+                // it was forwarded already, so it must not be recovered again
+                let slot = self.slot(far).unwrap();
+                let group = self.slots[slot].as_mut().unwrap();
+                group.data.push((far_index, far_datagram));
+                self.slot(id)
+            }
+            _ => {
+                self.far = Some((id, index, datagram.to_vec()));
+                None
+            }
+        }
     }
 
     /// Decodes a frame received from the peer. Returns the datagram to forward right away
@@ -405,13 +476,17 @@ impl Decoder {
         match frame[0] {
             TYPE_DATA => {
                 let payload = &frame[HEADROOM..];
-                let group = self.group(id);
+                let Some(slot) = self.data_slot(id, index, payload) else {
+                    // FEC can not help with this one, but it is still worth forwarding
+                    return Some(payload);
+                };
+                let group = self.slots[slot].as_mut().unwrap();
                 if group.done || group.data.iter().any(|(i, _)| *i == index) {
                     return None;
                 }
 
                 group.data.push((index, payload.to_vec()));
-                self.try_recover(id, recovered);
+                self.try_recover(slot, recovered);
 
                 Some(payload)
             }
@@ -425,7 +500,8 @@ impl Decoder {
                 }
 
                 let parity = &frame[PARITY_HEADER_LEN..];
-                let group = self.group(id);
+                let slot = self.slot(id)?;
+                let group = self.slots[slot].as_mut().unwrap();
                 if group.done
                     || group.params.is_some_and(|p| p != (k, m))
                     || group
@@ -438,7 +514,7 @@ impl Decoder {
 
                 group.params = Some((k, m));
                 group.parity.push((index, parity.to_vec()));
-                self.try_recover(id, recovered);
+                self.try_recover(slot, recovered);
 
                 None
             }
@@ -446,8 +522,8 @@ impl Decoder {
         }
     }
 
-    fn try_recover(&mut self, id: u32, recovered: &mut Vec<Vec<u8>>) {
-        let group = self.groups.get_mut(&id).unwrap();
+    fn try_recover(&mut self, slot: usize, recovered: &mut Vec<Vec<u8>>) {
+        let group = self.slots[slot].as_mut().unwrap();
         let Some((k, m)) = group.params else {
             return;
         };
@@ -962,7 +1038,147 @@ mod tests {
             frame[1..5].copy_from_slice(&id.to_be_bytes());
             assert!(decoder.feed(&frame, &mut recovered).is_some());
         }
-        assert_eq!(decoder.groups.len(), MAX_GROUPS);
-        assert_eq!(decoder.order.len(), MAX_GROUPS);
+        assert_eq!(decoder.slots.len(), MAX_GROUPS);
+        let mut ids: Vec<u32> = decoder
+            .slots
+            .iter()
+            .map(|g| g.as_ref().unwrap().id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            (MAX_GROUPS as u32 * 3..MAX_GROUPS as u32 * 4).collect::<Vec<_>>()
+        );
+    }
+
+    /// Encodes `groups * k` datagrams, which make `groups` groups when `k` is the size of a full
+    /// group, or a single group closed by timeout for 1 datagram. Returns the frames and datagrams.
+    fn groups(encoder: &mut Encoder, groups: usize, k: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let datagrams: Vec<_> = (0..groups * k).map(datagram).collect();
+        (encode(encoder, &datagrams), datagrams)
+    }
+
+    #[test]
+    fn late_parity_of_forgotten_group() {
+        let mut encoder = Encoder::new(config(10, 3));
+        let mut decoder = Decoder::default();
+
+        // a single datagram closed by timeout, whose 2 parity shards are delayed
+        let (first, _) = groups(&mut encoder, 1, 1);
+        let delivered = decode(&mut decoder, first[..1].iter());
+        assert_eq!(delivered, [datagram(0)]);
+
+        // the peer moves on by more groups than are remembered
+        let (frames, datagrams) = groups(&mut encoder, MAX_GROUPS, 10);
+        assert_eq!(decode(&mut decoder, frames.iter()), datagrams);
+
+        // the late parity must neither deliver the datagram again nor displace a recent group
+        let newest = decoder.newest;
+        assert!(decode(&mut decoder, first[1..].iter()).is_empty());
+        assert_eq!(decoder.newest, newest);
+        assert!(
+            decoder
+                .slots
+                .iter()
+                .flatten()
+                .all(|g| near(newest.unwrap(), g.id))
+        );
+    }
+
+    #[test]
+    fn stray_frame_before_first_group() {
+        let mut encoder = Encoder::new(config(10, 3));
+        // what a zeroed handshake packet looks like, and the group it would have collided with
+        encoder.group = 12345;
+        let (frames, datagrams) = groups(&mut encoder, 2, 10);
+
+        // one data shard of the second group is lost
+        let handshake = vec![0u8; 64];
+        let delivered = decode(
+            &mut Decoder::default(),
+            std::iter::once(&handshake).chain(
+                frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != 15)
+                    .map(|(_, f)| f),
+            ),
+        );
+        assert_eq!(delivered[0], handshake[HEADROOM..]);
+        assert_eq!(sorted(delivered[1..].to_vec()), sorted(datagrams));
+    }
+
+    #[test]
+    fn stray_frame_between_groups() {
+        let mut encoder = Encoder::new(config(10, 3));
+        let (first, mut datagrams) = groups(&mut encoder, 1, 10);
+        let (second, more) = groups(&mut encoder, 1, 10);
+        datagrams.extend(more);
+
+        let mut stray = vec![0u8; HEADROOM + 10];
+        stray[1..5].copy_from_slice(&encoder.group.wrapping_add(1 << 31).to_be_bytes());
+        let frames: Vec<_> = first
+            .iter()
+            .chain([&stray])
+            .chain(second.iter().skip(1))
+            .collect();
+        let delivered = decode(&mut Decoder::default(), frames.into_iter());
+
+        // the stray shard is forwarded, and the second group is still recovered
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|d| **d == stray[HEADROOM..])
+                .count(),
+            1
+        );
+        let delivered: Vec<_> = delivered
+            .into_iter()
+            .filter(|d| *d != stray[HEADROOM..])
+            .collect();
+        assert_eq!(sorted(delivered), sorted(datagrams));
+    }
+
+    #[test]
+    fn resync_after_long_outage() {
+        let mut encoder = Encoder::new(config(10, 3));
+        let mut decoder = Decoder::default();
+        let (frames, datagrams) = groups(&mut encoder, 1, 10);
+        assert_eq!(decode(&mut decoder, frames.iter()), datagrams);
+
+        // everything is lost for a while
+        encoder.group = encoder.group.wrapping_add(MAX_GROUPS as u32 * 2);
+
+        // the first data shard after the outage is forwarded, and the second one resyncs the decoder
+        let (frames, datagrams) = groups(&mut encoder, 2, 10);
+        let delivered = decode(
+            &mut decoder,
+            frames
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 18)
+                .map(|(_, f)| f),
+        );
+        assert_eq!(sorted(delivered), sorted(datagrams));
+        assert_eq!(decoder.newest, Some(encoder.group.wrapping_sub(1)));
+    }
+
+    #[test]
+    fn group_number_wrap_around() {
+        let mut encoder = Encoder::new(config(10, 3));
+        encoder.group = u32::MAX - 1;
+        let (frames, datagrams) = groups(&mut encoder, 4, 10);
+        assert_eq!(encoder.group, 2);
+
+        // one data shard lost in every group
+        let delivered = decode(
+            &mut Decoder::default(),
+            frames
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 13 != 4)
+                .map(|(_, f)| f),
+        );
+        assert_eq!(sorted(delivered), sorted(datagrams));
     }
 }

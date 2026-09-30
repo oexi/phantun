@@ -23,3 +23,4 @@ nix = { version = "0", features = ["net", "uio", "socket"] }
 tokio = { workspace = true }
 log = { workspace = true }
 reed-solomon-erasure = "6"
+rand = "0"
