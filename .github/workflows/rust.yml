@@ -7,15 +7,24 @@ env:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 also builds and tests the SIMD Reed-Solomon code
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
 
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
 
     steps:
     - uses: actions/checkout@v5
-    - uses: actions-rs/toolchain@v1
+    - uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: stable
+        components: clippy, rustfmt
+    - name: Check formatting
+      run: cargo fmt --all --check
     - name: Run lint
-      run: cargo clippy --verbose
+      run: cargo clippy --all-targets --locked -- -D warnings
+    - name: Run tests
+      run: cargo test --locked
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked

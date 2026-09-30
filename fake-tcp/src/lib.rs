@@ -45,14 +45,14 @@ pub mod packet;
 use bytes::{Bytes, BytesMut};
 use log::{error, info, trace, warn};
 use packet::*;
-use pnet::packet::{tcp, Packet};
+use pnet::packet::{Packet, tcp};
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc, RwLock,
+    atomic::{AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -472,27 +472,30 @@ impl Stack {
 
                             let tuple = AddrTuple::new(local_addr, remote_addr);
                             if let Some(c) = tuples.get(&tuple) {
-                                if c.send_async(buf).await.is_err() {
-                                    trace!("Cache hit, but receiver already closed, dropping packet");
-                                }
-
-                                continue;
-
-                                // If not Ok, receiver has been closed and just fall through to the slow
-                                // path below
-                            } else {
-                                trace!("Cache miss, checking the shared tuples table for connection");
-                                let sender = {
-                                    let tuples = shared.tuples.read().unwrap();
-                                    tuples.get(&tuple).cloned()
-                                };
-
-                                if let Some(c) = sender {
-                                    trace!("Storing connection information into local tuples");
-                                    tuples.insert(tuple, c.clone());
-                                    c.send_async(buf).await.unwrap();
+                                if c.send_async(buf.clone()).await.is_ok() {
                                     continue;
                                 }
+
+                                // The connection is closed but its purge has not been seen yet, and a
+                                // new connection may already use the same tuple, so fall through to
+                                // the slow path below
+                                trace!("Cache hit, but receiver already closed, removing cached tuple");
+                                tuples.remove(&tuple);
+                            }
+
+                            trace!("Cache miss, checking the shared tuples table for connection");
+                            let sender = {
+                                let tuples = shared.tuples.read().unwrap();
+                                tuples.get(&tuple).cloned()
+                            };
+
+                            if let Some(c) = sender {
+                                trace!("Storing connection information into local tuples");
+                                tuples.insert(tuple, c.clone());
+                                if c.send_async(buf).await.is_err() {
+                                    trace!("Connection closed while dispatching, dropping packet");
+                                }
+                                continue;
                             }
 
                             if tcp_packet.get_flags() == tcp::TcpFlags::SYN
@@ -525,11 +528,13 @@ impl Stack {
                                         local_addr,
                                         remote_addr,
                                         0,
-                                        tcp_packet.get_sequence() + tcp_packet.payload().len() as u32 + 1, // +1 because of SYN flag set
+                                        tcp_packet.get_sequence().wrapping_add(tcp_packet.payload().len() as u32 + 1), // +1 because of SYN flag set
                                         tcp::TcpFlags::RST | tcp::TcpFlags::ACK,
                                         None,
                                     );
-                                    shared.tun[0].try_send(&buf).unwrap();
+                                    if let Err(e) = shared.tun[0].try_send(&buf) {
+                                        warn!("Unable to send RST to {}: {}", remote_addr, e);
+                                    }
                                 }
                             } else if (tcp_packet.get_flags() & tcp::TcpFlags::RST) == 0 {
                                 info!("Unknown TCP packet from {}, sending RST", remote_addr);
@@ -537,11 +542,13 @@ impl Stack {
                                     local_addr,
                                     remote_addr,
                                     tcp_packet.get_acknowledgement(),
-                                    tcp_packet.get_sequence() + tcp_packet.payload().len() as u32,
+                                    tcp_packet.get_sequence().wrapping_add(tcp_packet.payload().len() as u32),
                                     tcp::TcpFlags::RST | tcp::TcpFlags::ACK,
                                     None,
                                 );
-                                shared.tun[0].try_send(&buf).unwrap();
+                                if let Err(e) = shared.tun[0].try_send(&buf) {
+                                    warn!("Unable to send RST to {}: {}", remote_addr, e);
+                                }
                             }
                         }
                         None => {
@@ -550,9 +557,21 @@ impl Stack {
                     }
                 },
                 tuple = tuples_purge.recv() => {
-                    let tuple = tuple.unwrap();
-                    tuples.remove(&tuple);
-                    trace!("Removed cached tuple: {:?}", tuple);
+                    match tuple {
+                        Ok(tuple) => {
+                            tuples.remove(&tuple);
+                            trace!("Removed cached tuple: {:?}", tuple);
+                        }
+                        // The channel only holds so many purges, and this task does not read it while
+                        // a connection's queue is full. The cache only mirrors `shared.tuples`, so it
+                        // can simply be rebuilt.
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            info!("Missed {} cached tuple purges, clearing the cache", skipped);
+                            tuples.clear();
+                        }
+                        // `shared` holds a sender, so the channel is never closed
+                        Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                    }
                 }
             }
         }

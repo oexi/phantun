@@ -27,6 +27,7 @@ A lightweight and fast UDP to TCP obfuscator.
     * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
 * [Forward error correction (FEC)](#forward-error-correction-fec)
     * [Burst loss](#burst-loss)
+    * [Statistics](#statistics)
 * [Version compatibility](#version-compatibility)
 * [Documentations](#documentations)
 * [Performance](#performance)
@@ -323,8 +324,9 @@ without retransmission, at the cost of extra bandwidth:
 
 ```
 --fec K:M           after every K packets, send M Reed-Solomon parity packets
---fec-timeout MS    send parity for a partially filled group after MS milliseconds (default: 8)
+--fec-timeout MS    send parity for a partially filled group after MS milliseconds (default: 8, max: 1000)
 --fec-interval MS   spread the parity packets of a group over MS milliseconds (default: 0, off, max: 1000)
+--fec-stats SECS    log packet statistics of each connection every SECS seconds (default: 300, 0: only when it closes)
 ```
 
 For every group of `K` packets, the peer can recover any `M` lost packets out of the `K + M`
@@ -351,6 +353,9 @@ more loss. Bandwidth overhead is `M / K` when groups are filled, e.g.:
 FEC adds a 6 byte header to data packets and parity packets are 10 bytes larger than the largest
 packet of their group, so remember to lower the [MTU](#mtu-calculation-for-wireguard) accordingly.
 
+If only one end has FEC enabled, the tunnel does not work, and the end with FEC enabled logs a
+warning once it has received a few packets that are not FEC frames.
+
 ## Burst loss
 
 The parity packets of a group are sent back to back, so on links that lose packets in bursts
@@ -364,7 +369,25 @@ To help, the interval has to be longer than the bursts it should survive, which 
 trade-off for latency sensitive traffic such as games: a packet recovered too late may be of no use
 anymore. Leave it off on links with random loss, where it only delays recovery. The peer only
 remembers the last 256 groups, so keep the interval well below the time it takes to send that many.
-Like `K:M`, it only applies to the parity sent by the end it is set on.
+Parity packets arriving later are counted as late in the [statistics](#statistics). Like `K:M`, it
+only applies to the parity sent by the end it is set on.
+
+## Statistics
+
+Each end logs the packets of every connection every `--fec-stats` seconds, and once more for the
+whole connection when it closes, though not when phantun itself is stopped:
+
+```
+FEC stats of (Fake TCP connection from 192.168.201.2:4567 to 10.0.0.2:40000) in the last 300s:
+sent 25000 data + 7500 parity packets, received 24130 data + 7270 parity packets, recovered 812 and
+lost 3 data packets (3.27% loss before FEC, 0.012% after)
+```
+
+The received and recovered packets are those sent by the peer, so the loss is the one of the
+direction towards this end, which the peer's `K:M` has to cope with. Raise `M` when packets are
+still lost after FEC, and lower it when the loss before FEC is well below what `K:M` is meant for.
+Lost packets at the end of a group are only noticed when a parity packet of that group arrives, so
+losses after FEC may be slightly undercounted.
 
 [Back to TOC](#table-of-contents)
 
