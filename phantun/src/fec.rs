@@ -29,12 +29,13 @@
 
 use clap::{Arg, ArgMatches, value_parser};
 use fake_tcp::Socket;
+use fake_tcp::packet::MAX_PACKET_LEN;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
@@ -53,7 +54,8 @@ pub const MTU_OVERHEAD: usize = PARITY_HEADER_LEN + LEN_PREFIX;
 /// mapping to the same slot when they wrap around
 const MAX_GROUPS: usize = 256;
 const _: () = assert!(MAX_GROUPS.is_power_of_two());
-const MAX_CODECS: usize = 64;
+/// Number of codecs the decoder keeps, enough for every group size of any peer
+const MAX_CODECS: usize = 256;
 /// Fraction of data shards that may stay unrecovered, used to find the loss rate a `K:M`
 /// ratio is meant for, and the parity shards smaller groups need to cope with it
 const TARGET_RESIDUAL_LOSS: f64 = 0.001;
@@ -237,30 +239,46 @@ fn parity_table(k: usize, m: usize) -> Vec<usize> {
         .collect()
 }
 
+fn codec(k: usize, m: usize) -> Option<Arc<ReedSolomon>> {
+    ReedSolomon::new(k, m).ok().map(Arc::new)
+}
+
+/// Codecs for the parameters chosen by the peer
 #[derive(Default)]
-struct Codecs(HashMap<(usize, usize), ReedSolomon>);
+struct Codecs(HashMap<(usize, usize), Arc<ReedSolomon>>);
 
 impl Codecs {
-    fn get(&mut self, k: usize, m: usize) -> Option<&ReedSolomon> {
+    fn get(&mut self, k: usize, m: usize) -> Option<Arc<ReedSolomon>> {
         if !self.0.contains_key(&(k, m)) {
             if self.0.len() >= MAX_CODECS {
                 self.0.clear();
             }
-            self.0.insert((k, m), ReedSolomon::new(k, m).ok()?);
+            self.0.insert((k, m), codec(k, m)?);
         }
 
-        self.0.get(&(k, m))
+        self.0.get(&(k, m)).cloned()
     }
+}
+
+/// Lays out a datagram as a data shard for encoding, `| len (u16 BE) | datagram |`, leaving room
+/// for padding up to the largest datagram
+fn data_shard(datagram: &[u8]) -> Vec<u8> {
+    let mut shard = Vec::with_capacity(LEN_PREFIX + MAX_PACKET_LEN);
+    shard.extend_from_slice(&(datagram.len() as u16).to_be_bytes());
+    shard.extend_from_slice(datagram);
+    shard
 }
 
 struct Encoder {
     config: FecConfig,
     /// Number of parity shards by number of data shards in the group, minus one
     parity: Vec<usize>,
+    /// Codecs by number of data shards in the group, minus one, created as needed
+    codecs: Vec<Option<Arc<ReedSolomon>>>,
     group: u32,
+    /// Data shards of the current group, not padded yet
     shards: Vec<Vec<u8>>,
     started: Option<Instant>,
-    codecs: Codecs,
 }
 
 impl Encoder {
@@ -268,32 +286,28 @@ impl Encoder {
         Encoder {
             config,
             parity: parity_table(config.data_shards, config.parity_shards),
+            codecs: vec![None; config.data_shards],
             // a random start makes it unlikely that anything else the peer receives, such as a
             // handshake packet, passes for a shard of a recent group
             group: rand::random(),
             shards: Vec::with_capacity(config.data_shards),
             started: None,
-            codecs: Codecs::default(),
         }
     }
 
     /// Turns `buf` (`HEADROOM` bytes followed by the datagram) into a data shard in place.
-    /// Returns parity shards to send if this closes the current group.
-    fn push(&mut self, buf: &mut [u8], now: Instant) -> Vec<Vec<u8>> {
+    /// Returns the group if this closes it.
+    fn push(&mut self, buf: &mut [u8], now: Instant) -> Option<ClosedGroup> {
         buf[0] = TYPE_DATA;
         buf[1..5].copy_from_slice(&self.group.to_be_bytes());
         buf[5] = self.shards.len() as u8;
-        self.shards.push(buf[HEADROOM..].to_vec());
+        self.shards.push(data_shard(&buf[HEADROOM..]));
 
         if self.started.is_none() {
             self.started = Some(now);
         }
 
-        if self.shards.len() == self.config.data_shards {
-            self.finish()
-        } else {
-            Vec::new()
-        }
+        (self.shards.len() == self.config.data_shards).then(|| self.finish())
     }
 
     /// When the current group has to be flushed, or `None` if it is empty
@@ -301,30 +315,57 @@ impl Encoder {
         self.started.map(|t| t + self.config.timeout)
     }
 
-    fn flush_expired(&mut self, now: Instant) -> Vec<Vec<u8>> {
+    fn flush_expired(&mut self, now: Instant) -> Option<ClosedGroup> {
         match self.deadline() {
-            Some(deadline) if deadline <= now => self.finish(),
-            _ => Vec::new(),
+            Some(deadline) if deadline <= now => Some(self.finish()),
+            _ => None,
         }
     }
 
-    /// Closes the current group and returns its parity shards
-    fn finish(&mut self) -> Vec<Vec<u8>> {
+    /// Closes the current group
+    fn finish(&mut self) -> ClosedGroup {
         let k = self.shards.len();
         let m = self.parity[k - 1];
-        let shard_size = LEN_PREFIX + self.shards.iter().map(Vec::len).max().unwrap_or(0);
-
-        let data: Vec<Vec<u8>> = self
-            .shards
-            .drain(..)
-            .map(|d| {
-                let mut shard = Vec::with_capacity(shard_size);
-                shard.extend_from_slice(&(d.len() as u16).to_be_bytes());
-                shard.extend_from_slice(&d);
-                shard.resize(shard_size, 0);
-                shard
+        let codec = self.codecs[k - 1]
+            .get_or_insert_with(|| {
+                codec(k, m).expect("FEC parameters are validated by parse_ratio")
             })
-            .collect();
+            .clone();
+
+        let group = ClosedGroup {
+            group: self.group,
+            shards: std::mem::replace(
+                &mut self.shards,
+                Vec::with_capacity(self.config.data_shards),
+            ),
+            codec,
+        };
+        self.group = self.group.wrapping_add(1);
+        self.started = None;
+
+        group
+    }
+}
+
+/// A group whose parity shards are yet to be computed, which is left for after the encoder is
+/// unlocked
+struct ClosedGroup {
+    group: u32,
+    shards: Vec<Vec<u8>>,
+    codec: Arc<ReedSolomon>,
+}
+
+impl ClosedGroup {
+    /// Returns the parity shards of the group
+    fn encode(mut self) -> Vec<Vec<u8>> {
+        let (k, m) = (
+            self.codec.data_shard_count(),
+            self.codec.parity_shard_count(),
+        );
+        let shard_size = self.shards.iter().map(Vec::len).max().unwrap();
+        for shard in &mut self.shards {
+            shard.resize(shard_size, 0);
+        }
 
         let mut parity: Vec<Vec<u8>> = (0..m)
             .map(|i| {
@@ -338,20 +379,13 @@ impl Encoder {
             })
             .collect();
 
-        let codec = self
-            .codecs
-            .get(k, m)
-            .expect("FEC parameters are validated by parse_ratio");
         let mut parity_shards: Vec<&mut [u8]> = parity
             .iter_mut()
             .map(|p| &mut p[PARITY_HEADER_LEN..])
             .collect();
-        codec
-            .encode_sep(&data, &mut parity_shards)
+        self.codec
+            .encode_sep(&self.shards, &mut parity_shards)
             .expect("shards are of equal size");
-
-        self.group = self.group.wrapping_add(1);
-        self.started = None;
 
         parity
     }
@@ -361,6 +395,7 @@ struct Group {
     id: u32,
     /// `(k, m)`, known once a parity shard has been received
     params: Option<(usize, usize)>,
+    /// Data shards, not padded yet
     data: Vec<(u8, Vec<u8>)>,
     parity: Vec<(u8, Vec<u8>)>,
     done: bool,
@@ -394,7 +429,7 @@ struct Decoder {
     slots: Vec<Option<Group>>,
     /// Newest group seen, those `MAX_GROUPS` or more before it are forgotten
     newest: Option<u32>,
-    /// `(group, index, datagram)` of the last data shard too far from the recent groups to keep
+    /// `(group, index, shard)` of the last data shard too far from the recent groups to keep
     /// track of
     far: Option<(u32, u8, Vec<u8>)>,
     codecs: Codecs,
@@ -446,28 +481,27 @@ impl Decoder {
         }
 
         match self.far.take() {
-            Some((far, far_index, far_datagram)) if near(far, id) => {
+            Some((far, far_index, far_shard)) if near(far, id) => {
                 self.slots.fill_with(|| None);
                 self.newest = Some(id);
                 // it was forwarded already, so it must not be recovered again
                 let slot = self.slot(far).unwrap();
                 let group = self.slots[slot].as_mut().unwrap();
-                group.data.push((far_index, far_datagram));
+                group.data.push((far_index, far_shard));
                 self.slot(id)
             }
             _ => {
-                self.far = Some((id, index, datagram.to_vec()));
+                self.far = Some((id, index, data_shard(datagram)));
                 None
             }
         }
     }
 
-    /// Decodes a frame received from the peer. Returns the datagram to forward right away
-    /// if `frame` is a new data shard, and appends datagrams recovered from lost data
-    /// shards to `recovered`.
-    fn feed<'a>(&mut self, frame: &'a [u8], recovered: &mut Vec<Vec<u8>>) -> Option<&'a [u8]> {
+    /// Decodes a frame received from the peer. Returns the datagram to forward right away if
+    /// `frame` is a new data shard, and the group if lost data shards can now be recovered.
+    fn feed<'a>(&mut self, frame: &'a [u8]) -> (Option<&'a [u8]>, Option<Recovery>) {
         if frame.len() < HEADROOM {
-            return None;
+            return (None, None);
         }
 
         let id = u32::from_be_bytes(frame[1..5].try_into().unwrap());
@@ -478,29 +512,29 @@ impl Decoder {
                 let payload = &frame[HEADROOM..];
                 let Some(slot) = self.data_slot(id, index, payload) else {
                     // FEC can not help with this one, but it is still worth forwarding
-                    return Some(payload);
+                    return (Some(payload), None);
                 };
                 let group = self.slots[slot].as_mut().unwrap();
                 if group.done || group.data.iter().any(|(i, _)| *i == index) {
-                    return None;
+                    return (None, None);
                 }
 
-                group.data.push((index, payload.to_vec()));
-                self.try_recover(slot, recovered);
-
-                Some(payload)
+                group.data.push((index, data_shard(payload)));
+                (Some(payload), self.recovery(slot))
             }
             TYPE_PARITY => {
                 if frame.len() < PARITY_HEADER_LEN + LEN_PREFIX {
-                    return None;
+                    return (None, None);
                 }
                 let (k, m) = (frame[6] as usize, frame[7] as usize);
                 if k == 0 || m == 0 || (index as usize) < k || index as usize >= k + m {
-                    return None;
+                    return (None, None);
                 }
 
                 let parity = &frame[PARITY_HEADER_LEN..];
-                let slot = self.slot(id)?;
+                let Some(slot) = self.slot(id) else {
+                    return (None, None);
+                };
                 let group = self.slots[slot].as_mut().unwrap();
                 if group.done
                     || group.params.is_some_and(|p| p != (k, m))
@@ -509,60 +543,75 @@ impl Decoder {
                         .iter()
                         .any(|(i, p)| *i == index || p.len() != parity.len())
                 {
-                    return None;
+                    return (None, None);
                 }
 
                 group.params = Some((k, m));
                 group.parity.push((index, parity.to_vec()));
-                self.try_recover(slot, recovered);
-
-                None
+                (None, self.recovery(slot))
             }
-            _ => None,
+            _ => (None, None),
         }
     }
 
-    fn try_recover(&mut self, slot: usize, recovered: &mut Vec<Vec<u8>>) {
+    /// Closes the group in `slot` once it has either all of its data shards, or enough shards to
+    /// recover the lost ones, which it then returns
+    fn recovery(&mut self, slot: usize) -> Option<Recovery> {
         let group = self.slots[slot].as_mut().unwrap();
-        let Some((k, m)) = group.params else {
-            return;
-        };
+        let (k, m) = group.params?;
 
         if group.data.len() >= k {
             // nothing lost
             group.close();
-            return;
+            return None;
         }
         if group.data.len() + group.parity.len() < k {
-            return;
+            return None;
         }
 
         let data = std::mem::take(&mut group.data);
         let parity = std::mem::take(&mut group.parity);
         group.close();
 
-        let shard_size = parity[0].1.len();
+        Some(Recovery {
+            data,
+            parity,
+            codec: self.codecs.get(k, m)?,
+        })
+    }
+}
+
+/// A group with enough shards to recover its lost data shards, which is left for after the
+/// decoder is unlocked
+struct Recovery {
+    data: Vec<(u8, Vec<u8>)>,
+    parity: Vec<(u8, Vec<u8>)>,
+    codec: Arc<ReedSolomon>,
+}
+
+impl Recovery {
+    /// Appends the datagrams of the lost data shards to `recovered`
+    fn run(self, recovered: &mut Vec<Vec<u8>>) {
+        let (k, m) = (
+            self.codec.data_shard_count(),
+            self.codec.parity_shard_count(),
+        );
+        let shard_size = self.parity[0].1.len();
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; k + m];
-        for (index, payload) in data {
-            if index as usize >= k || LEN_PREFIX + payload.len() > shard_size {
+        for (index, mut shard) in self.data {
+            if index as usize >= k || shard.len() > shard_size {
                 return;
             }
 
-            let mut shard = Vec::with_capacity(shard_size);
-            shard.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-            shard.extend_from_slice(&payload);
             shard.resize(shard_size, 0);
             shards[index as usize] = Some(shard);
         }
-        for (index, parity) in parity {
+        for (index, parity) in self.parity {
             shards[index as usize] = Some(parity);
         }
 
         let missing: Vec<usize> = (0..k).filter(|&i| shards[i].is_none()).collect();
-        let Some(codec) = self.codecs.get(k, m) else {
-            return;
-        };
-        if codec.reconstruct_data(&mut shards).is_err() {
+        if self.codec.reconstruct_data(&mut shards).is_err() {
             return;
         }
 
@@ -614,8 +663,10 @@ impl Fec {
             }
 
             let now = Instant::now();
-            let parity = self.encoder.lock().unwrap().flush_expired(now);
-            out.extend(self.schedule(parity, now));
+            let closed = self.encoder.lock().unwrap().flush_expired(now);
+            if let Some(closed) = closed {
+                out.extend(self.schedule(closed.encode(), now));
+            }
             self.pacer.lock().unwrap().pop_due(now, &mut out);
             for p in out.drain(..) {
                 if sock.send(&p).await.is_none() {
@@ -659,20 +710,21 @@ pub async fn send_datagram(sock: &Socket, fec: Option<&Fec>, buf: &mut [u8]) -> 
     };
 
     let now = Instant::now();
-    let parity = {
+    let closed = {
         let mut encoder = fec.encoder.lock().unwrap();
         let group_started = encoder.started.is_none();
-        let parity = encoder.push(buf, now);
+        let closed = encoder.push(buf, now);
         if group_started && encoder.started.is_some() {
             fec.wake.notify_one();
         }
-        parity
+        closed
     };
-    let parity = fec.schedule(parity, now);
 
     sock.send(buf).await?;
-    for p in parity {
-        sock.send(&p).await?;
+    if let Some(closed) = closed {
+        for p in fec.schedule(closed.encode(), now) {
+            sock.send(&p).await?;
+        }
     }
 
     Some(())
@@ -691,12 +743,15 @@ pub async fn forward_to_udp(
         return Ok(());
     };
 
-    let datagram = fec.decoder.lock().unwrap().feed(frame, recovered);
+    let (datagram, recovery) = fec.decoder.lock().unwrap().feed(frame);
     if let Some(datagram) = datagram {
         udp_sock.send(datagram).await?;
     }
-    for datagram in recovered.drain(..) {
-        udp_sock.send(&datagram).await?;
+    if let Some(recovery) = recovery {
+        recovery.run(recovered);
+        for datagram in recovered.drain(..) {
+            udp_sock.send(&datagram).await?;
+        }
     }
 
     Ok(())
@@ -726,12 +781,23 @@ mod tests {
         for d in datagrams {
             let mut buf = vec![0u8; HEADROOM];
             buf.extend_from_slice(d);
-            let parity = encoder.push(&mut buf, now);
+            let closed = encoder.push(&mut buf, now);
             frames.push(buf);
-            frames.extend(parity);
+            frames.extend(closed.into_iter().flat_map(ClosedGroup::encode));
         }
-        frames.extend(encoder.flush_expired(now + Duration::from_secs(1)));
+        let closed = encoder.flush_expired(now + Duration::from_secs(1));
+        frames.extend(closed.into_iter().flat_map(ClosedGroup::encode));
         frames
+    }
+
+    /// Feeds `frame` into `decoder` and appends recovered datagrams to `recovered`. Returns the
+    /// datagram to forward right away.
+    fn feed(decoder: &mut Decoder, frame: &[u8], recovered: &mut Vec<Vec<u8>>) -> Option<Vec<u8>> {
+        let (datagram, recovery) = decoder.feed(frame);
+        if let Some(recovery) = recovery {
+            recovery.run(recovered);
+        }
+        datagram.map(<[u8]>::to_vec)
     }
 
     /// Feeds `frames` into `decoder` and returns every datagram it delivers
@@ -742,9 +808,7 @@ mod tests {
         let mut delivered = Vec::new();
         let mut recovered = Vec::new();
         for f in frames {
-            if let Some(d) = decoder.feed(f, &mut recovered) {
-                delivered.push(d.to_vec());
-            }
+            delivered.extend(feed(decoder, f, &mut recovered));
             delivered.append(&mut recovered);
         }
         delivered
@@ -975,18 +1039,42 @@ mod tests {
         assert_eq!(encoder.deadline(), None);
 
         let mut buf = vec![0u8; HEADROOM + 100];
-        assert!(encoder.push(&mut buf, now).is_empty());
+        assert!(encoder.push(&mut buf, now).is_none());
         assert_eq!(encoder.deadline(), Some(now + Duration::from_millis(10)));
         assert!(
             encoder
                 .flush_expired(now + Duration::from_millis(9))
-                .is_empty()
+                .is_none()
         );
-        assert_eq!(
-            encoder.flush_expired(now + Duration::from_millis(10)).len(),
-            2
-        );
+        let closed = encoder.flush_expired(now + Duration::from_millis(10));
+        assert_eq!(closed.unwrap().encode().len(), 2);
         assert_eq!(encoder.deadline(), None);
+    }
+
+    #[test]
+    fn encoder_codec_per_group_size() {
+        // more group sizes than the previous cache of 64 codecs held
+        let mut encoder = Encoder::new(config(70, 2));
+        let now = Instant::now();
+        let mut codecs = Vec::new();
+        for round in 0..2 {
+            for n in 1..=70 {
+                let mut closed = None;
+                for _ in 0..n {
+                    let mut buf = vec![0u8; HEADROOM + 10];
+                    closed = encoder.push(&mut buf, now);
+                }
+                let closed = closed
+                    .or_else(|| encoder.flush_expired(now + Duration::from_secs(1)))
+                    .unwrap();
+                assert_eq!(closed.codec.data_shard_count(), n);
+                if round == 0 {
+                    codecs.push(closed.codec);
+                } else {
+                    assert!(Arc::ptr_eq(&codecs[n - 1], &closed.codec));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1004,28 +1092,30 @@ mod tests {
             &[1, 0, 0, 0, 0, 1, 1, 1, 0],
         ];
         for f in frames {
-            assert!(decoder.feed(f, &mut recovered).is_none());
+            assert!(feed(&mut decoder, f, &mut recovered).is_none());
         }
 
         // parity claiming a length larger than the shard
         assert!(
-            decoder
-                .feed(&[1, 0, 0, 0, 1, 1, 1, 1, 0xff, 0xff], &mut recovered)
-                .is_none()
+            feed(
+                &mut decoder,
+                &[1, 0, 0, 0, 1, 1, 1, 1, 0xff, 0xff],
+                &mut recovered
+            )
+            .is_none()
         );
         assert!(recovered.is_empty());
 
         // data shard larger than the parity shards of its group
         assert!(
-            decoder
-                .feed(&[1, 0, 0, 0, 2, 2, 2, 1, 0, 0], &mut recovered)
-                .is_none()
+            feed(
+                &mut decoder,
+                &[1, 0, 0, 0, 2, 2, 2, 1, 0, 0],
+                &mut recovered
+            )
+            .is_none()
         );
-        assert!(
-            decoder
-                .feed(&[0, 0, 0, 0, 2, 0, 1, 2, 3], &mut recovered)
-                .is_some()
-        );
+        assert!(feed(&mut decoder, &[0, 0, 0, 0, 2, 0, 1, 2, 3], &mut recovered).is_some());
         assert!(recovered.is_empty());
     }
 
@@ -1036,7 +1126,7 @@ mod tests {
         for id in 0..(MAX_GROUPS as u32 * 4) {
             let mut frame = vec![0u8; HEADROOM + 10];
             frame[1..5].copy_from_slice(&id.to_be_bytes());
-            assert!(decoder.feed(&frame, &mut recovered).is_some());
+            assert!(feed(&mut decoder, &frame, &mut recovered).is_some());
         }
         assert_eq!(decoder.slots.len(), MAX_GROUPS);
         let mut ids: Vec<u32> = decoder
