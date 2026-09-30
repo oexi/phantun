@@ -27,10 +27,12 @@
 //! from the received packet size. The number of data shards in a group is only known
 //! once the group is closed, so only parity shards carry `k` and `m`.
 
+use clap::{Arg, ArgMatches, value_parser};
 use fake_tcp::Socket;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::fmt;
 use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -56,8 +58,65 @@ const TARGET_RESIDUAL_LOSS: f64 = 0.001;
 /// Most parity shards a connection keeps waiting when they are spread out. Beyond this, parity
 /// shards are sent right away rather than growing the queue without bound.
 const MAX_PENDING_PARITY: usize = 4096;
-/// Longest time parity shards may be spread over, far longer than any burst worth riding out
-const MAX_INTERVAL: Duration = Duration::from_secs(1);
+/// Longest time in milliseconds a partial group may wait for more packets, far longer than any
+/// recovery delay worth waiting for
+const MAX_TIMEOUT_MS: u64 = 1000;
+/// Longest time in milliseconds parity shards may be spread over, far longer than any burst worth
+/// riding out
+const MAX_INTERVAL_MS: u64 = 1000;
+
+/// Command line arguments configuring FEC, shared by the client and the server
+pub fn args() -> [Arg; 3] {
+    [
+        Arg::new("fec")
+            .long("fec")
+            .required(false)
+            .value_name("K:M")
+            .value_parser(parse_ratio)
+            .help("Enables forward error correction: after every K packets, M parity packets are \
+                   sent so that up to M lost packets can be recovered by the peer. \
+                   Must be enabled on both ends, K:M can differ per direction. \
+                   Reduce the WireGuard MTU by another 10 bytes when enabled"),
+        Arg::new("fec_timeout")
+            .long("fec-timeout")
+            .required(false)
+            .value_name("MS")
+            .value_parser(value_parser!(u64).range(0..=MAX_TIMEOUT_MS))
+            .requires("fec")
+            .help("Sends parity packets for a group of less than K packets after this many milliseconds, \
+                   at most 1000")
+            .default_value("8"),
+        Arg::new("fec_interval")
+            .long("fec-interval")
+            .required(false)
+            .value_name("MS")
+            .value_parser(value_parser!(u64).range(0..=MAX_INTERVAL_MS))
+            .requires("fec")
+            .help("Spreads the parity packets of each group evenly over this many milliseconds \
+                   instead of sending them back to back, so that a burst of loss is less likely \
+                   to take out a whole group. The first parity packet is still sent right away, \
+                   but recovery from a burst may be delayed by up to this much. 0 disables, at most 1000")
+            .default_value("0"),
+    ]
+}
+
+/// Parses `K:M`, where `K` is the number of data shards and `M` the number of parity shards per
+/// group.
+fn parse_ratio(ratio: &str) -> Result<(usize, usize), String> {
+    let (k, m) = ratio
+        .split_once(':')
+        .ok_or_else(|| format!("expected K:M, got \"{ratio}\""))?;
+    let k: usize = k.parse().map_err(|_| format!("bad K in \"{ratio}\""))?;
+    let m: usize = m.parse().map_err(|_| format!("bad M in \"{ratio}\""))?;
+
+    if k == 0 || m == 0 || k + m > 256 {
+        return Err(format!(
+            "K and M must be at least 1 and K + M must not exceed 256, got \"{ratio}\""
+        ));
+    }
+
+    Ok((k, m))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FecConfig {
@@ -69,32 +128,27 @@ pub struct FecConfig {
 }
 
 impl FecConfig {
-    /// Parses `K:M`, where `K` is the number of data shards and `M` the number of parity shards
-    /// per group.
-    pub fn parse(ratio: &str, timeout: Duration, interval: Duration) -> Result<FecConfig, String> {
-        let (k, m) = ratio
-            .split_once(':')
-            .ok_or_else(|| format!("expected K:M, got \"{ratio}\""))?;
-        let k: usize = k.parse().map_err(|_| format!("bad K in \"{ratio}\""))?;
-        let m: usize = m.parse().map_err(|_| format!("bad M in \"{ratio}\""))?;
+    /// Reads the configuration from the arguments of [`args`], `None` if FEC is not enabled
+    pub fn from_matches(matches: &ArgMatches) -> Option<FecConfig> {
+        let &(data_shards, parity_shards) = matches.get_one::<(usize, usize)>("fec")?;
+        let millis = |id| Duration::from_millis(*matches.get_one::<u64>(id).unwrap());
 
-        if k == 0 || m == 0 || k + m > 256 {
-            return Err(format!(
-                "K and M must be at least 1 and K + M must not exceed 256, got \"{ratio}\""
-            ));
-        }
-        if interval > MAX_INTERVAL {
-            return Err(format!(
-                "the interval must not exceed {MAX_INTERVAL:?}, got {interval:?}"
-            ));
-        }
-
-        Ok(FecConfig {
-            data_shards: k,
-            parity_shards: m,
-            timeout,
-            interval,
+        Some(FecConfig {
+            data_shards,
+            parity_shards,
+            timeout: millis("fec_timeout"),
+            interval: millis("fec_interval"),
         })
+    }
+}
+
+impl fmt::Display for FecConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}:{}, timeout {:?}, parity spread over {:?}",
+            self.data_shards, self.parity_shards, self.timeout, self.interval
+        )
     }
 }
 
@@ -283,7 +337,7 @@ impl Encoder {
         let codec = self
             .codecs
             .get(k, m)
-            .expect("FEC parameters are validated by FecConfig::parse");
+            .expect("FEC parameters are validated by parse_ratio");
         let mut parity_shards: Vec<&mut [u8]> = parity
             .iter_mut()
             .map(|p| &mut p[PARITY_HEADER_LEN..])
@@ -625,26 +679,50 @@ mod tests {
         v
     }
 
+    fn parse_args(args: &[&str]) -> Result<Option<FecConfig>, clap::Error> {
+        clap::Command::new("phantun")
+            .args(super::args())
+            .try_get_matches_from(std::iter::once("phantun").chain(args.iter().copied()))
+            .map(|m| FecConfig::from_matches(&m))
+    }
+
     #[test]
     fn parse_config() {
-        let t = Duration::from_millis(8);
-        let i = Duration::from_millis(20);
+        assert_eq!(parse_args(&[]).unwrap(), None);
         assert_eq!(
-            FecConfig::parse("10:3", t, i),
-            Ok(FecConfig {
+            parse_args(&["--fec", "10:3"]).unwrap(),
+            Some(FecConfig {
                 data_shards: 10,
                 parity_shards: 3,
-                timeout: t,
-                interval: i,
+                timeout: Duration::from_millis(8),
+                interval: Duration::ZERO,
             })
         );
-        assert!(FecConfig::parse("10", t, i).is_err());
-        assert!(FecConfig::parse("0:3", t, i).is_err());
-        assert!(FecConfig::parse("10:0", t, i).is_err());
-        assert!(FecConfig::parse("200:57", t, i).is_err());
-        assert!(FecConfig::parse("200:56", t, i).is_ok());
-        assert!(FecConfig::parse("10:3", t, MAX_INTERVAL).is_ok());
-        assert!(FecConfig::parse("10:3", t, MAX_INTERVAL + Duration::from_millis(1)).is_err());
+        assert_eq!(
+            parse_args(&["--fec=20:2", "--fec-timeout", "0", "--fec-interval=1000"]).unwrap(),
+            Some(FecConfig {
+                data_shards: 20,
+                parity_shards: 2,
+                timeout: Duration::ZERO,
+                interval: Duration::from_secs(1),
+            })
+        );
+
+        for bad in [
+            &["--fec", "10"][..],
+            &["--fec", "0:3"],
+            &["--fec", "10:0"],
+            &["--fec", "200:57"],
+            &["--fec", "10:3", "--fec-timeout", "1001"],
+            &["--fec", "10:3", "--fec-interval", "1001"],
+            &["--fec", "10:3", "--fec-interval", "-1"],
+            // timing options without --fec
+            &["--fec-timeout", "8"],
+            &["--fec-interval", "20"],
+        ] {
+            assert!(parse_args(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_args(&["--fec", "200:56"]).is_ok());
     }
 
     #[test]

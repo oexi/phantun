@@ -323,7 +323,7 @@ without retransmission, at the cost of extra bandwidth:
 
 ```
 --fec K:M           after every K packets, send M Reed-Solomon parity packets
---fec-timeout MS    send parity for a partially filled group after MS milliseconds (default: 8)
+--fec-timeout MS    send parity for a partially filled group after MS milliseconds (default: 8, max: 1000)
 --fec-interval MS   spread the parity packets of a group over MS milliseconds (default: 0, off, max: 1000)
 ```
 

@@ -9,7 +9,6 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
 use tokio_tun::TunBuilder;
@@ -103,35 +102,7 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
-        .arg(
-            Arg::new("fec")
-                .long("fec")
-                .required(false)
-                .value_name("K:M")
-                .help("Enables forward error correction: after every K packets, M parity packets are \
-                       sent so that up to M lost packets can be recovered by the peer. \
-                       Must be enabled on both ends, K:M can differ per direction. \
-                       Reduce the WireGuard MTU by another 10 bytes when enabled")
-        )
-        .arg(
-            Arg::new("fec_timeout")
-                .long("fec-timeout")
-                .required(false)
-                .value_name("MS")
-                .help("Sends parity packets for a group of less than K packets after this many milliseconds")
-                .default_value("8")
-        )
-        .arg(
-            Arg::new("fec_interval")
-                .long("fec-interval")
-                .required(false)
-                .value_name("MS")
-                .help("Spreads the parity packets of each group evenly over this many milliseconds \
-                       instead of sending them back to back, so that a burst of loss is less likely \
-                       to take out a whole group. The first parity packet is still sent right away, \
-                       but recovery from a burst may be delayed by up to this much. 0 disables, at most 1000")
-                .default_value("0")
-        )
+        .args(fec::args())
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -179,29 +150,9 @@ async fn main() -> io::Result<()> {
         .map(fs::read)
         .transpose()?;
 
-    let fec_config = matches.get_one::<String>("fec").map(|ratio| {
-        let timeout = matches
-            .get_one::<String>("fec_timeout")
-            .unwrap()
-            .parse()
-            .expect("bad FEC timeout");
-        let interval = matches
-            .get_one::<String>("fec_interval")
-            .unwrap()
-            .parse()
-            .expect("bad FEC interval");
-        FecConfig::parse(
-            ratio,
-            Duration::from_millis(timeout),
-            Duration::from_millis(interval),
-        )
-        .unwrap_or_else(|e| panic!("bad FEC parameters: {e}"))
-    });
+    let fec_config = FecConfig::from_matches(&matches);
     if let Some(c) = fec_config {
-        info!(
-            "FEC enabled: {}:{}, timeout {:?}, parity spread over {:?}",
-            c.data_shards, c.parity_shards, c.timeout, c.interval
-        );
+        info!("FEC enabled: {c}");
     }
 
     let num_cpus = num_cpus::get();
