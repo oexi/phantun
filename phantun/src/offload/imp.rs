@@ -226,8 +226,15 @@ pub struct Offload {
 impl Offload {
     /// Loads the programs for the Tun interface `tun`. With `fec`, records of FEC frames are
     /// passed to Phantun, otherwise the buffer for them is kept small. With `nic`, the packets of
-    /// connections are converted on their network interface where possible.
-    pub fn new(tun: &str, fec: bool, nic: bool) -> Result<Offload, String> {
+    /// connections are converted on their network interface where possible, and `remote`, the
+    /// address of the Tun interface and the remote end of the connections, if known, helps to find
+    /// it in advance.
+    pub fn new(
+        tun: &str,
+        fec: bool,
+        nic: bool,
+        remote: Option<(IpAddr, IpAddr)>,
+    ) -> Result<Offload, String> {
         let tun_ifindex = if_index(tun).ok_or_else(|| format!("no interface {tun}"))?;
         // a power of two and a multiple of the page size
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u32;
@@ -316,6 +323,9 @@ impl Offload {
         };
         // On failure, dropping `offload` removes the filters attached so far
         offload.attach(tcp_to_udp, udp_to_tcp, redirect, tun_ingress)?;
+        if nic {
+            offload.prepare_nics(remote);
+        }
 
         offload.ipv4_unavailable = enable_ipv4_delivery().err();
         if let Some(ref e) = offload.ipv4_unavailable {
@@ -399,6 +409,38 @@ impl Offload {
             }
         }
         Ok(())
+    }
+
+    /// Adds a clsact qdisc to the network interfaces that connections are likely to use: those of
+    /// the default routes, and the one to `remote`. Adding a qdisc drops the packets queued on
+    /// the interface, so doing it once the first connection uses the interface would usually drop
+    /// the end of its handshake. The programs are only attached then.
+    fn prepare_nics(&self, remote: Option<(IpAddr, IpAddr)>) {
+        let Ok(mut nl) = Netlink::new() else {
+            return;
+        };
+        let mut interfaces = nl.default_route_interfaces().unwrap_or_else(|e| {
+            debug!("Unable to look up the default routes: {e}");
+            Vec::new()
+        });
+        if let Some((local, remote)) = remote
+            && let Ok(ifindex) = nl.forward_interface(local, remote, self.tun_ifindex)
+        {
+            interfaces.push(ifindex);
+        }
+        interfaces.sort_unstable();
+        interfaces.dedup();
+        for ifindex in interfaces {
+            if ifindex == self.tun_ifindex || ifindex == LOOPBACK_IFINDEX {
+                continue;
+            }
+            let supported = nl.link(ifindex).is_ok_and(|(t, _)| {
+                [ARPHRD_ETHER, ARPHRD_NONE, ARPHRD_PPP, ARPHRD_RAWIP].contains(&t)
+            });
+            if supported && let Err(e) = nl.add_clsact(ifindex) {
+                debug!("Unable to add a clsact qdisc to interface {ifindex}: {e}");
+            }
+        }
     }
 
     /// Attaches the programs to the network interface `ifindex`, unless they are already

@@ -51,6 +51,8 @@ const RTA_DST: u16 = 1;
 const RTA_SRC: u16 = 2;
 const RTA_IIF: u16 = 3;
 const RTA_OIF: u16 = 4;
+const RTA_MULTIPATH: u16 = 9;
+const RTN_UNICAST: u8 = 1;
 
 const NETLINK_NETFILTER: libc::c_int = 12;
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
@@ -459,6 +461,44 @@ impl Netlink {
             .find(|(t, p)| *t == RTA_OIF && p.len() == 4)
             .map(|(_, p)| u32::from_ne_bytes(p.try_into().unwrap()))
             .ok_or_else(|| io::Error::other("the route has no output interface"))
+    }
+
+    /// The output interfaces of the default routes, of both IP versions
+    pub fn default_route_interfaces(&mut self) -> io::Result<Vec<u32>> {
+        let mut interfaces = Vec::new();
+        for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+            let msg = Message::new(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP)
+                .header(&[family, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            for reply in self.request(msg)? {
+                // struct rtmsg: dst_len and type
+                if reply.len() < 12 || reply[1] != 0 || reply[7] != RTN_UNICAST {
+                    continue;
+                }
+                for (t, p) in attrs(&reply[12..]) {
+                    match t {
+                        RTA_OIF if p.len() == 4 => {
+                            interfaces.push(u32::from_ne_bytes(p.try_into().unwrap()))
+                        }
+                        // struct rtnexthop: len, flags, hops, ifindex, followed by attributes
+                        RTA_MULTIPATH => {
+                            let mut rest = p;
+                            while rest.len() >= 8 {
+                                let len = u16::from_ne_bytes([rest[0], rest[1]]) as usize;
+                                interfaces.push(u32::from_ne_bytes(rest[4..8].try_into().unwrap()));
+                                if len < 8 {
+                                    break;
+                                }
+                                rest = &rest[len.next_multiple_of(4).min(rest.len())..];
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        interfaces.sort_unstable();
+        interfaces.dedup();
+        Ok(interfaces)
     }
 
     /// The link type (ARPHRD_*) and name of an interface

@@ -16,7 +16,7 @@
 use crate::fec::Fec;
 use clap::{Arg, ArgAction, ArgMatches};
 use fake_tcp::Socket;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 pub fn args() -> [Arg; 2] {
@@ -43,13 +43,19 @@ pub fn args() -> [Arg; 2] {
 }
 
 /// Sets up the eBPF data path for the Tun interface `tun`, unless it is disabled or not possible,
-/// which is logged
-pub fn start(matches: &ArgMatches, tun: &str, fec: bool) -> Option<Arc<Offload>> {
+/// which is logged. `remote` is the address of Phantun on the Tun interface and that of the
+/// remote end, where all connections go to.
+pub fn start(
+    matches: &ArgMatches,
+    tun: &str,
+    fec: bool,
+    remote: Option<(IpAddr, IpAddr)>,
+) -> Option<Arc<Offload>> {
     if matches.get_flag("no_ebpf") {
         log::info!("eBPF data path disabled by --no-ebpf");
         return None;
     }
-    match Offload::new(tun, fec, !matches.get_flag("no_ebpf_nic")) {
+    match Offload::new(tun, fec, !matches.get_flag("no_ebpf_nic"), remote) {
         Ok(offload) => {
             log::info!("eBPF data path enabled");
             let offload = Arc::new(offload);
@@ -118,13 +124,18 @@ pub use imp::{Connection, Offload};
 mod imp {
     use crate::fec::Fec;
     use fake_tcp::Socket;
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
 
     pub enum Offload {}
 
     impl Offload {
-        pub fn new(_tun: &str, _fec: bool, _nic: bool) -> Result<Offload, String> {
+        pub fn new(
+            _tun: &str,
+            _fec: bool,
+            _nic: bool,
+            _remote: Option<(IpAddr, IpAddr)>,
+        ) -> Result<Offload, String> {
             Err("Phantun was built without eBPF support".to_string())
         }
 

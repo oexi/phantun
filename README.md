@@ -485,7 +485,11 @@ entering it in a hash table, which costs other traffic little.
 ## Changes to the host
 
 * A `clsact` qdisc is added to the Tun and the loopback interface, and to the network interfaces
-  that connections use, which stays on the latter two.
+  that connections use, which stays on the latter two. Adding a qdisc drops the packets queued on
+  the interface at that moment, so Phantun adds it at startup to the interfaces of the default
+  routes, and of the route to the server for the client, rather than when the first connection
+  uses them, which would drop the end of its handshake. This is skipped where the interface
+  already has one.
 * Two tc filters named `phantun:<tun name>` are added to ingress of loopback, and of each network
   interface used, at priorities 28776 and 28777. Phantun removes them when it receives SIGTERM or
   SIGINT. If it is killed, they do nothing until the next instance removes them.
