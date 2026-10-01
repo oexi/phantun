@@ -4,7 +4,10 @@ use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
 use phantun::fec::{self, Fec, FecConfig, HEADROOM};
 use phantun::offload;
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal, udp_recv_pktinfo};
+use phantun::utils::{
+    assign_ipv6_address, connect_udp_reuseport, new_udp_reuseport, raise_fd_limit, shutdown_signal,
+    udp_recv_pktinfo,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -20,6 +23,7 @@ use phantun::UDP_TTL;
 #[tokio::main]
 async fn main() -> io::Result<()> {
     pretty_env_logger::init();
+    raise_fd_limit();
 
     let matches = Command::new("Phantun Client")
         .version(crate_version!())
@@ -186,7 +190,7 @@ async fn main() -> io::Result<()> {
         Some((tun_peer_ip, remote_addr.ip())),
     );
 
-    let udp_sock = Arc::new(new_udp_reuseport(local_addr));
+    let udp_sock = Arc::new(new_udp_reuseport(local_addr)?);
     let connections = Arc::new(RwLock::new(HashMap::<
         SocketAddr,
         (Arc<Socket>, Option<Arc<Fec>>),
@@ -264,18 +268,18 @@ async fn main() -> io::Result<()> {
                 }
             };
 
-            let mut udp_socks = Vec::with_capacity(num_cpus);
-            for _ in 0..num_cpus {
-                let udp_sock = new_udp_reuseport(bind_addr);
-                if let Err(e) = udp_sock.connect(udp_remote_addr).await {
-                    error!("Unable to connect UDP socket to {}: {}", udp_remote_addr, e);
-                    break;
+            // Dropping the connection, e.g. when out of file descriptors, keeps the others
+            let udp_socks = match connect_udp_reuseport(bind_addr, udp_remote_addr, num_cpus).await
+            {
+                Ok(socks) => socks,
+                Err(e) => {
+                    error!(
+                        "Unable to connect UDP socket to {}: {}, closing connection",
+                        udp_remote_addr, e
+                    );
+                    continue;
                 }
-                udp_socks.push(Arc::new(udp_sock));
-            }
-            if udp_socks.len() < num_cpus {
-                continue;
-            }
+            };
 
             let offloaded =
                 offload::register(offload.as_ref(), &mut sock, bind_addr, udp_remote_addr);

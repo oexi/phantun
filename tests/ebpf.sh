@@ -89,6 +89,30 @@ def oneway(host, port, count, size):
     except socket.timeout:
         print(0)
 
+# Echoes a datagram, sends one from each of `count` other sources, which are new connections, and
+# echoes again. Prints 1 if both echoes arrived.
+def flood(host, port, count):
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_DGRAM)
+    s.settimeout(2)
+    s.connect((host, port))
+
+    def echo():
+        s.send(b"ping")
+        try:
+            return s.recv(64) == b"ping"
+        except socket.timeout:
+            return False
+
+    ok = echo()
+    others = []
+    for i in range(count):
+        o = socket.socket(family, socket.SOCK_DGRAM)
+        o.sendto(b"x", (host, port))
+        others.append(o)
+        time.sleep(0.05)
+    print(int(ok and echo()))
+
 globals()[sys.argv[1]](sys.argv[2], *map(int, sys.argv[3:]))
 EOF
 
@@ -256,6 +280,35 @@ oneway() {
   fi
 }
 
+# fd_limit: the server runs out of file descriptors as connections come in, and has to refuse the
+# new ones while it keeps serving the others
+fd_limit() {
+  echo "=== Out of file descriptors"
+  ip netns exec $NS_S prlimit --nofile=64 env RUST_LOG=info "$BIN_DIR/server" --local 4567 --remote 127.0.0.1:7777 \
+    --tun phantun-ts0 --no-ebpf > "$WORK/server.log" 2>&1 &
+  ip netns exec $NS_C env RUST_LOG=info "$BIN_DIR/client" --local 127.0.0.1:1984 --remote 10.199.0.2:4567 \
+    --tun phantun-tc0 --no-ebpf > "$WORK/client.log" 2>&1 &
+  sleep 1
+
+  local ok refused
+  ok=$(ip netns exec $NS_C python3 "$WORK/echo.py" flood 127.0.0.1 1984 60)
+  refused=$(grep -c "Too many open files" "$WORK/server.log" || true)
+
+  pkill -f "^$BIN_DIR/(server|client) " || true
+  sleep 0.5
+
+  local result=pass
+  if [ "$ok" != 1 ] || [ "$refused" -eq 0 ]; then
+    result=fail
+    failed=1
+  fi
+  echo "first connection served: $ok, connections refused: $refused: $result"
+  if [ $result = fail ]; then
+    echo "--- server log"; cat "$WORK/server.log"
+    echo "--- client log"; cat "$WORK/client.log"
+  fi
+}
+
 setup
 run "IPv4" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic
 run "IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic
@@ -267,6 +320,7 @@ run "--no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --no-ebpf
 # Through conntrack on both ends
 oneway "One way, --no-ebpf-nic" --no-ebpf-nic
 oneway "One way, --no-ebpf" --no-ebpf
+fd_limit
 loss 5
 run "FEC with 5% loss" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic --fec 4:2
 run "FEC with 5% loss, IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic --fec 4:2

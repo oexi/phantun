@@ -1,3 +1,4 @@
+use log::debug;
 use neli::{
     consts::{
         nl::NlmF,
@@ -13,12 +14,16 @@ use neli::{
 use nix::sys::socket::{
     CmsgIterator, ControlMessageOwned, MsgFlags, SockaddrLike, SockaddrStorage, cmsg_space,
 };
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
-pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
+/// A UDP socket bound to `local_addr` with SO_REUSEPORT. It fails like any socket would, e.g. when
+/// the process has as many file descriptors open as it may.
+pub fn new_udp_reuseport(local_addr: SocketAddr) -> io::Result<UdpSocket> {
     let udp_sock = socket2::Socket::new(
         if local_addr.is_ipv4() {
             socket2::Domain::IPV4
@@ -27,31 +32,60 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
         },
         socket2::Type::DGRAM,
         None,
-    )
-    .unwrap();
-    udp_sock.set_reuse_port(true).unwrap();
+    )?;
+    udp_sock.set_reuse_port(true)?;
     raise_recv_buffer(&udp_sock);
     // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
-    udp_sock.set_cloexec(true).unwrap();
-    udp_sock.set_nonblocking(true).unwrap();
+    udp_sock.set_cloexec(true)?;
+    udp_sock.set_nonblocking(true)?;
 
     // enable IP_PKTINFO/IPV6_PKTINFO delivery so we know the destination address of incoming
     // packets
     if local_addr.is_ipv4() {
-        nix::sys::socket::setsockopt(&udp_sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
-            .unwrap();
+        nix::sys::socket::setsockopt(&udp_sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)?;
     } else {
         nix::sys::socket::setsockopt(
             &udp_sock,
             nix::sys::socket::sockopt::Ipv6RecvPacketInfo,
             &true,
-        )
-        .unwrap();
+        )?;
     }
 
-    udp_sock.bind(&socket2::SockAddr::from(local_addr)).unwrap();
+    udp_sock.bind(&socket2::SockAddr::from(local_addr))?;
     let udp_sock: std::net::UdpSocket = udp_sock.into();
-    udp_sock.try_into().unwrap()
+    udp_sock.try_into()
+}
+
+/// `count` UDP sockets bound to `local_addr` with SO_REUSEPORT and connected to `remote_addr`, one
+/// for each worker of a connection
+pub async fn connect_udp_reuseport(
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    count: usize,
+) -> io::Result<Vec<Arc<UdpSocket>>> {
+    let mut socks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let sock = new_udp_reuseport(local_addr)?;
+        sock.connect(remote_addr).await?;
+        socks.push(Arc::new(sock));
+    }
+    Ok(socks)
+}
+
+/// Raises the limit of open file descriptors to the most the process may have. Each connection
+/// takes as many UDP sockets as there are CPUs, so the usual limit of 1024 only allows a few dozen
+/// on hosts with many CPUs.
+pub fn raise_fd_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) if soft < hard => match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+            Ok(()) => debug!("Raised the limit of open files from {soft} to {hard}"),
+            Err(e) => debug!("Unable to raise the limit of open files from {soft}: {e}"),
+        },
+        Ok(_) => {}
+        Err(e) => debug!("Unable to get the limit of open files: {e}"),
+    }
 }
 
 /// The receive buffer size of the UDP sockets. Applications such as kernel WireGuard send
