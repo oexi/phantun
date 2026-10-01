@@ -4,10 +4,10 @@ use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
 use phantun::fec::{self, Fec, FecConfig, HEADROOM};
 use phantun::offload;
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal};
+use phantun::utils::{assign_ipv6_address, connect_udp_reuseport, raise_fd_limit, shutdown_signal};
 use std::fs;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
@@ -17,9 +17,28 @@ use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
 
+/// The UDP sockets of a new connection, one for each worker, connected to `remote_addr` from a
+/// free port, and the address the remote end sees their datagrams coming from
+async fn connect_udp(
+    remote_addr: SocketAddr,
+    count: usize,
+) -> io::Result<(Vec<Arc<UdpSocket>>, SocketAddr)> {
+    let local_addr = UdpSocket::bind(if remote_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?
+    .local_addr()?;
+    let socks = connect_udp_reuseport(local_addr, remote_addr, count).await?;
+    let udp_local = socks[0].local_addr()?;
+    Ok((socks, udp_local))
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     pretty_env_logger::init();
+    raise_fd_limit();
 
     let matches = Command::new("Phantun Server")
         .version(crate_version!())
@@ -191,30 +210,18 @@ async fn main() -> io::Result<()> {
             let mut sock = stack.accept().await;
             info!("New connection: {}", sock);
 
-            let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            })
-            .await?;
-            let local_addr = udp_sock.local_addr()?;
-            drop(udp_sock);
-
-            let mut udp_socks = Vec::with_capacity(num_cpus);
-            for _ in 0..num_cpus {
-                let udp_sock = new_udp_reuseport(local_addr);
-                if let Err(e) = udp_sock.connect(remote_addr).await {
-                    error!("Unable to connect UDP socket to {}: {}", remote_addr, e);
-                    break;
+            // Dropping the connection, e.g. when out of file descriptors, keeps the others
+            let (udp_socks, udp_local) = match connect_udp(remote_addr, num_cpus).await {
+                Ok(socks) => socks,
+                Err(e) => {
+                    error!(
+                        "Unable to connect UDP socket to {}: {}, closing connection",
+                        remote_addr, e
+                    );
+                    continue;
                 }
-                udp_socks.push(Arc::new(udp_sock));
-            }
-            if udp_socks.len() < num_cpus {
-                continue;
-            }
+            };
 
-            // The address the remote end sees our datagrams coming from
-            let udp_local = udp_socks[0].local_addr()?;
             let offloaded = offload::register(offload.as_ref(), &mut sock, udp_local, remote_addr);
             let sock = Arc::new(sock);
 
@@ -268,7 +275,7 @@ async fn main() -> io::Result<()> {
                                     Some(size) => {
                                         if size > 0
                                             && let Err(e) = fec::forward_to_udp(&udp_sock, fec.as_deref(), &buf_tcp[..size], &mut recovered).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                error!("Unable to send UDP packet to {}: {}, closing connection", remote_addr, e);
                                                 quit.cancel();
                                                 return;
                                             }
