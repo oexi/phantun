@@ -29,6 +29,7 @@ A lightweight and fast UDP to TCP obfuscator.
     * [Burst loss](#burst-loss)
     * [Statistics](#statistics)
 * [eBPF data path](#ebpf-data-path)
+    * [On the network interface](#on-the-network-interface)
     * [Requirements](#requirements)
     * [Changes to the host](#changes-to-the-host)
 * [Version compatibility](#version-compatibility)
@@ -404,41 +405,72 @@ inside the kernel, which no longer have to be copied to and from Phantun. This i
 automatically, nothing needs to be configured, and the packets on the wire are the same, so either
 end may use it regardless of what the other end does.
 
-In a test with WireGuard over Phantun between two network namespaces of a 4 core ARM VM, with
-20 ms of round trip time added between them, `iperf3` reached:
+In a test with WireGuard over Phantun between two network namespaces of a 4 core ARM VM, `iperf3`
+reached:
 
-| Phantun                            | Throughput   | TCP retransmissions |
-|------------------------------------|--------------|---------------------|
-| v0.8.1                             | 459 Mbit/s   | 38844               |
-| eBPF data path                     | 1.05 Gbit/s  | 0                   |
-| FEC `10:2`, 1% loss, without eBPF  | 347 Mbit/s   | 15387               |
-| FEC `10:2`, 1% loss, eBPF          | 910 Mbit/s   | 33                  |
+| Phantun                                       | No added delay | 20 ms RTT    | 20 ms RTT, 1% loss, FEC `10:2` |
+|-----------------------------------------------|----------------|--------------|--------------------------------|
+| Without eBPF (`--no-ebpf`)                    | 526 Mbit/s     | 474 Mbit/s   | 353 Mbit/s                     |
+| eBPF on the Tun interface (`--no-ebpf-nic`)   | 1.08 Gbit/s    | 1.05 Gbit/s  | 858 Mbit/s                     |
+| eBPF on the network interface (the default)   | 1.54 Gbit/s    | 1.07 Gbit/s  | 1.00 Gbit/s                    |
+
+Without eBPF, TCP inside WireGuard retransmitted about 25000 segments in 10 seconds at 20 ms RTT,
+with eBPF almost none. With 20 ms RTT and no loss, something other than Phantun limits the
+throughput.
 
 With [FEC](#forward-error-correction-fec), the programs convert data shards and pass a copy of
 them to Phantun, which computes the parity shards from them and recovers lost data shards, so only
 parity shards and recovered datagrams pass through Phantun.
 
-Phantun logs whether it is used, once at startup and then for each connection:
+Phantun logs whether it is used, once at startup and then for each connection, with where the
+packets are converted:
 
 ```
 INFO  phantun::offload > eBPF data path enabled
-INFO  phantun::offload > Packets of (Fake TCP connection from 192.168.201.2:4567 to 10.0.0.2:40000) are converted by eBPF
+INFO  phantun::offload > Packets of (Fake TCP connection from 192.168.201.2:4567 to 10.0.0.2:40000) are converted by eBPF on eth0
 ```
 
-With FEC, the second line ends in `are converted by eBPF, with FEC computed by Phantun`.
+With FEC, the second line ends in `, with FEC computed by Phantun`.
 
 Otherwise, the log says why not, and Phantun works as before, e.g. on RouterOS or in containers
 without the privileges needed. `--no-ebpf` disables it.
 
-Handshakes, RSTs, packets merged by GRO and anything unusual still go through Phantun, so the
+Handshakes and anything unusual still go through Phantun, so the
 [firewall rules](#2-add-required-firewall-rules) are needed all the same. To keep the receiving
 kernel from merging data packets with GRO, Phantun now sets the PSH flag on them, which older
 versions ignore.
 
+## On the network interface
+
+Like [mimic](https://github.com/hack3ric/mimic), the programs convert the packets on the network
+interface the fake TCP connection uses, e.g. `eth0`: fake TCP packets as they arrive, and datagrams
+from the application straight into fake TCP packets that leave the interface. These packets skip
+the Tun interface, routing and netfilter (conntrack, NAT and the firewall rules), so that only the
+handshake passes through them. The packets that Phantun sends itself, such as FEC parity shards,
+are sent the same way, and the packets that Phantun receives, such as those merged by GRO, are
+passed to it on the Tun interface, with the addresses NAT would have given them.
+
+Phantun finds the network interface the way the kernel forwards the packets from the Tun interface,
+and the addresses NAT gave the connection in conntrack, and attaches the programs to the interface
+when the first connection uses it. Where this is not possible, the log says why, e.g.
+
+```
+INFO  phantun::offload > Packets of (...) are converted by eBPF on the Tun interface tun0 (not on the network interface: ...)
+```
+
+and the packets are converted on the Tun interface instead, after routing and NAT, which is also
+what `--no-ebpf-nic` does. Those packets still pass through the kernel's forwarding path, which is
+slower, as the table above shows.
+
+Network interfaces with an Ethernet header are supported, and those without one (`ARPHRD_NONE`,
+PPP or raw IP), such as WireGuard. The program on the network interface looks up every TCP packet
+entering it in a hash table, which costs other traffic little.
+
 ## Requirements
 
 * Linux 5.12 or newer, with the `cls_bpf`, `act_csum` and `sch_ingress` (clsact) tc modules,
-  which distributions ship.
+  which distributions ship. On the network interface, conntrack has to be available through
+  netlink (`nf_conntrack_netlink`, loaded on demand) if the host NATs the connection.
 * Root, or the `cap_net_admin` and `cap_bpf` capabilities:
   `sudo setcap cap_net_admin,cap_bpf=+pe phantun_server`.
 * The UDP peer of a connection has to be on the same host (in the same network namespace), e.g.
@@ -452,14 +484,24 @@ versions ignore.
 
 ## Changes to the host
 
-* A `clsact` qdisc is added to the Tun and the loopback interface, which stays on loopback.
-* Two tc filters named `phantun:<tun name>` are added to ingress of loopback, at priorities 28776
-  and 28777. Phantun removes them when it receives SIGTERM or SIGINT. If it is killed, they do
-  nothing until the next instance removes them.
+* A `clsact` qdisc is added to the Tun and the loopback interface, and to the network interfaces
+  that connections use, which stays on the latter two. Adding a qdisc drops the packets queued on
+  the interface at that moment, so Phantun adds it at startup to the interfaces of the default
+  routes, and of the route to the server for the client, rather than when the first connection
+  uses them, which would drop the end of its handshake. This is skipped where the interface
+  already has one.
+* Two tc filters named `phantun:<tun name>` are added to ingress of loopback, and of each network
+  interface used, at priorities 28776 and 28777. Phantun removes them when it receives SIGTERM or
+  SIGINT. If it is killed, they do nothing until the next instance removes them.
 * `net.ipv4.conf.lo.route_localnet` and `net.ipv4.conf.lo.accept_local` are set to 1 and not
   reverted. Without them, the kernel drops IPv4 datagrams that the programs deliver to local
   addresses. They only affect packets entering the loopback interface without a route, which
   happens when they are redirected there like these, not to ordinary local traffic.
+* On the network interface, conntrack sees the handshake of a connection but none of its later
+  packets, so its entry expires after the timeout of established TCP connections
+  (`net.netfilter.nf_conntrack_tcp_timeout_established`, 5 days by default) even while the
+  connection is in use. The packets of the connection do not depend on the entry, but traffic
+  shaping or accounting with netfilter or on the Tun interface does not see them either.
 
 [Back to TOC](#table-of-contents)
 

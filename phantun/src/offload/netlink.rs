@@ -1,7 +1,9 @@
-//! Just enough rtnetlink to attach the eBPF programs with tc. aya can only attach direct action
-//! classifiers, but the converting classifiers need a csum action.
+//! Just enough netlink for the eBPF data path: tc, to attach the programs, as aya can only attach
+//! direct action classifiers, but the converting classifiers need a csum action; routes and links,
+//! to find the network interface of a connection; and conntrack, to find its addresses after NAT.
 
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use nix::libc;
@@ -22,6 +24,8 @@ const NLA_TYPE_MASK: u16 = 0x3fff;
 const SOL_NETLINK: libc::c_int = 270;
 const NETLINK_EXT_ACK: libc::c_int = 11;
 
+const RTM_GETLINK: u16 = 18;
+const RTM_GETROUTE: u16 = 26;
 const RTM_NEWQDISC: u16 = 36;
 const RTM_NEWTFILTER: u16 = 44;
 const RTM_DELTFILTER: u16 = 45;
@@ -41,6 +45,29 @@ pub const TCA_CSUM_UPDATE_FLAG_IPV4HDR: u32 = 1;
 pub const TCA_CSUM_UPDATE_FLAG_TCP: u32 = 8;
 pub const TCA_CSUM_UPDATE_FLAG_UDP: u32 = 16;
 const TC_ACT_UNSPEC: i32 = -1;
+
+const IFLA_IFNAME: u16 = 3;
+const RTA_DST: u16 = 1;
+const RTA_SRC: u16 = 2;
+const RTA_IIF: u16 = 3;
+const RTA_OIF: u16 = 4;
+const RTA_MULTIPATH: u16 = 9;
+const RTN_UNICAST: u8 = 1;
+
+const NETLINK_NETFILTER: libc::c_int = 12;
+const NFNL_SUBSYS_CTNETLINK: u16 = 1;
+const IPCTNL_MSG_CT_GET: u16 = 1;
+const CTA_TUPLE_ORIG: u16 = 1;
+const CTA_TUPLE_REPLY: u16 = 2;
+const CTA_TUPLE_IP: u16 = 1;
+const CTA_TUPLE_PROTO: u16 = 2;
+const CTA_IP_V4_SRC: u16 = 1;
+const CTA_IP_V4_DST: u16 = 2;
+const CTA_IP_V6_SRC: u16 = 3;
+const CTA_IP_V6_DST: u16 = 4;
+const CTA_PROTO_NUM: u16 = 1;
+const CTA_PROTO_SRC_PORT: u16 = 2;
+const CTA_PROTO_DST_PORT: u16 = 3;
 
 const TC_H_CLSACT: u32 = 0xffff_fff1;
 const ETH_P_ALL: u16 = 0x0003;
@@ -85,6 +112,12 @@ impl Message {
         buf[4..6].copy_from_slice(&msg_type.to_ne_bytes());
         buf[6..8].copy_from_slice(&flags.to_ne_bytes());
         Message { buf }
+    }
+
+    /// Appends the fixed header that follows the netlink header
+    fn header(mut self, header: &[u8]) -> Message {
+        self.buf.extend_from_slice(header);
+        self
     }
 
     fn tcmsg(mut self, ifindex: u32, handle: u32, parent: u32, info: u32) -> Message {
@@ -165,12 +198,22 @@ pub struct Netlink {
 }
 
 impl Netlink {
+    /// A socket for rtnetlink
     pub fn new() -> io::Result<Netlink> {
+        Netlink::with_protocol(libc::NETLINK_ROUTE)
+    }
+
+    /// A socket for conntrack
+    pub fn conntrack() -> io::Result<Netlink> {
+        Netlink::with_protocol(NETLINK_NETFILTER)
+    }
+
+    fn with_protocol(protocol: libc::c_int) -> io::Result<Netlink> {
         let fd = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_ROUTE,
+                protocol,
             )
         };
         if fd < 0 {
@@ -194,6 +237,15 @@ impl Netlink {
     /// Sends a request and returns the payloads of the messages it gets back, until the ACK of
     /// a request or the end of a dump
     fn request(&mut self, msg: Message) -> io::Result<Vec<Vec<u8>>> {
+        self.request_until(msg, |_| false)
+    }
+
+    /// Like [`Netlink::request`], but also stops once `done` returns true for the replies so far
+    fn request_until(
+        &mut self,
+        msg: Message,
+        done: impl Fn(&[Vec<u8>]) -> bool,
+    ) -> io::Result<Vec<Vec<u8>>> {
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
         let buf = msg.finish(seq);
@@ -261,6 +313,9 @@ impl Netlink {
                     NLMSG_DONE => return Ok(replies),
                     _ => replies.push(payload.to_vec()),
                 }
+            }
+            if done(&replies) {
+                return Ok(replies);
             }
         }
     }
@@ -382,6 +437,193 @@ impl Netlink {
         }
         Ok(filters)
     }
+}
+
+impl Netlink {
+    /// The interface the kernel forwards a packet from `src` to `dst` to, which arrived on
+    /// `iif`, like `ip route get <dst> from <src> iif <iif>`
+    pub fn forward_interface(&mut self, src: IpAddr, dst: IpAddr, iif: u32) -> io::Result<u32> {
+        let (family, bits) = match dst {
+            IpAddr::V4(_) => (libc::AF_INET as u8, 32),
+            IpAddr::V6(_) => (libc::AF_INET6 as u8, 128),
+        };
+        // struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags
+        let mut msg = Message::new(RTM_GETROUTE, NLM_F_REQUEST)
+            .header(&[family, bits, bits, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        msg.attr(RTA_DST, &ip_octets(dst));
+        msg.attr(RTA_SRC, &ip_octets(src));
+        msg.attr(RTA_IIF, &iif.to_ne_bytes());
+        let replies = self.request_one(msg)?;
+        replies
+            .iter()
+            .filter_map(|r| r.get(12..))
+            .flat_map(attrs)
+            .find(|(t, p)| *t == RTA_OIF && p.len() == 4)
+            .map(|(_, p)| u32::from_ne_bytes(p.try_into().unwrap()))
+            .ok_or_else(|| io::Error::other("the route has no output interface"))
+    }
+
+    /// The output interfaces of the default routes, of both IP versions
+    pub fn default_route_interfaces(&mut self) -> io::Result<Vec<u32>> {
+        let mut interfaces = Vec::new();
+        for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+            let msg = Message::new(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP)
+                .header(&[family, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            for reply in self.request(msg)? {
+                // struct rtmsg: dst_len and type
+                if reply.len() < 12 || reply[1] != 0 || reply[7] != RTN_UNICAST {
+                    continue;
+                }
+                for (t, p) in attrs(&reply[12..]) {
+                    match t {
+                        RTA_OIF if p.len() == 4 => {
+                            interfaces.push(u32::from_ne_bytes(p.try_into().unwrap()))
+                        }
+                        // struct rtnexthop: len, flags, hops, ifindex, followed by attributes
+                        RTA_MULTIPATH => {
+                            let mut rest = p;
+                            while rest.len() >= 8 {
+                                let len = u16::from_ne_bytes([rest[0], rest[1]]) as usize;
+                                interfaces.push(u32::from_ne_bytes(rest[4..8].try_into().unwrap()));
+                                if len < 8 {
+                                    break;
+                                }
+                                rest = &rest[len.next_multiple_of(4).min(rest.len())..];
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        interfaces.sort_unstable();
+        interfaces.dedup();
+        Ok(interfaces)
+    }
+
+    /// The link type (ARPHRD_*) and name of an interface
+    pub fn link(&mut self, ifindex: u32) -> io::Result<(u16, String)> {
+        // struct ifinfomsg: family, padding, type, index, flags, change
+        let mut header = [0u8; 16];
+        header[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        let msg = Message::new(RTM_GETLINK, NLM_F_REQUEST).header(&header);
+        let replies = self.request_one(msg)?;
+        let reply = replies
+            .first()
+            .filter(|r| r.len() >= 16)
+            .ok_or_else(|| io::Error::other("no link"))?;
+        let link_type = u16::from_ne_bytes([reply[2], reply[3]]);
+        let name = attrs(&reply[16..])
+            .find(|(t, _)| *t == IFLA_IFNAME)
+            .map_or_else(|| ifindex.to_string(), |(_, p)| attr_string(p));
+        Ok((link_type, name))
+    }
+
+    /// Sends a request that is answered by a single message rather than an ACK
+    fn request_one(&mut self, msg: Message) -> io::Result<Vec<Vec<u8>>> {
+        self.request_until(msg, |replies| !replies.is_empty())
+    }
+
+    /// The addresses on the wire of the TCP connection from `local` to `remote`, in conntrack,
+    /// where NAT may have changed them, as (local, remote). `None` if conntrack does not know
+    /// the connection.
+    pub fn conntrack_wire_addresses(
+        &mut self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> io::Result<Option<(SocketAddr, SocketAddr)>> {
+        let family = match local {
+            SocketAddr::V4(_) => libc::AF_INET as u8,
+            SocketAddr::V6(_) => libc::AF_INET6 as u8,
+        };
+        // struct nfgenmsg: family, version, resource ID
+        let mut msg = Message::new(
+            (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET,
+            NLM_F_REQUEST | NLM_F_ACK,
+        )
+        .header(&[family, 0, 0, 0]);
+        // Finds the entry whichever direction the tuple is of
+        msg.nest(CTA_TUPLE_ORIG, |m| {
+            m.nest(CTA_TUPLE_IP, |m| {
+                let (src, dst) = match family as i32 {
+                    libc::AF_INET => (CTA_IP_V4_SRC, CTA_IP_V4_DST),
+                    _ => (CTA_IP_V6_SRC, CTA_IP_V6_DST),
+                };
+                m.attr(src, &ip_octets(local.ip()));
+                m.attr(dst, &ip_octets(remote.ip()));
+            });
+            m.nest(CTA_TUPLE_PROTO, |m| {
+                m.attr(CTA_PROTO_NUM, &[libc::IPPROTO_TCP as u8]);
+                m.attr(CTA_PROTO_SRC_PORT, &local.port().to_be_bytes());
+                m.attr(CTA_PROTO_DST_PORT, &remote.port().to_be_bytes());
+            });
+        });
+        let replies = match self.request(msg) {
+            Ok(replies) => replies,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let reply = replies
+            .first()
+            .and_then(|r| r.get(4..))
+            .ok_or_else(|| io::Error::other("empty conntrack reply"))?;
+        let mut tuples = [None, None];
+        for (t, payload) in attrs(reply) {
+            if t == CTA_TUPLE_ORIG || t == CTA_TUPLE_REPLY {
+                tuples[(t - CTA_TUPLE_ORIG) as usize] = parse_ct_tuple(payload);
+            }
+        }
+        let [Some(orig), Some(reply)] = tuples else {
+            return Err(io::Error::other("incomplete conntrack entry"));
+        };
+        // Packets from the other end are of the other direction
+        let incoming = if orig == (local, remote) { reply } else { orig };
+        Ok(Some((incoming.1, incoming.0)))
+    }
+}
+
+fn ip_octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+/// A CTA_TUPLE_* as (source, destination)
+fn parse_ct_tuple(buf: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+    let (mut src, mut dst, mut sport, mut dport) = (None, None, None, None);
+    for (t, payload) in attrs(buf) {
+        match t {
+            CTA_TUPLE_IP => {
+                for (t, p) in attrs(payload) {
+                    let ip = match p.len() {
+                        4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(p).unwrap())),
+                        16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(p).unwrap())),
+                        _ => continue,
+                    };
+                    match t {
+                        CTA_IP_V4_SRC | CTA_IP_V6_SRC => src = Some(ip),
+                        CTA_IP_V4_DST | CTA_IP_V6_DST => dst = Some(ip),
+                        _ => {}
+                    }
+                }
+            }
+            CTA_TUPLE_PROTO => {
+                for (t, p) in attrs(payload) {
+                    let Ok(port) = <[u8; 2]>::try_from(p) else {
+                        continue;
+                    };
+                    match t {
+                        CTA_PROTO_SRC_PORT => sport = Some(u16::from_be_bytes(port)),
+                        CTA_PROTO_DST_PORT => dport = Some(u16::from_be_bytes(port)),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((SocketAddr::new(src?, sport?), SocketAddr::new(dst?, dport?)))
 }
 
 fn info(id: FilterId) -> u32 {

@@ -174,7 +174,7 @@ async fn main() -> io::Result<()> {
 
     info!("Created TUN device {}", tun[0].name());
 
-    let offload = offload::start(&matches, tun[0].name(), fec_config.is_some());
+    let offload = offload::start(&matches, tun[0].name(), fec_config.is_some(), None);
 
     //thread::sleep(time::Duration::from_secs(5));
     let mut stack = Stack::new(tun, tun_local, tun_local6);

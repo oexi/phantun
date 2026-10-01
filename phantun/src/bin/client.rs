@@ -175,7 +175,16 @@ async fn main() -> io::Result<()> {
 
     info!("Created TUN device {}", tun[0].name());
 
-    let offload = offload::start(&matches, tun[0].name(), fec_config.is_some());
+    let tun_peer_ip = match remote_addr {
+        SocketAddr::V4(_) => IpAddr::V4(tun_peer),
+        SocketAddr::V6(_) => IpAddr::V6(tun_peer6.unwrap()),
+    };
+    let offload = offload::start(
+        &matches,
+        tun[0].name(),
+        fec_config.is_some(),
+        Some((tun_peer_ip, remote_addr.ip())),
+    );
 
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<
