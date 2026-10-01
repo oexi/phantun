@@ -341,7 +341,7 @@ async fn main() -> io::Result<()> {
                                     Some(size) => {
                                         if size > 0
                                             && let Err(e) = fec::forward_to_udp(&udp_sock, fec.as_deref(), &buf_tcp[..size], &mut recovered).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                error!("Unable to send UDP packet to {}: {}, closing connection", udp_remote_addr, e);
                                                 quit.cancel();
                                                 return;
                                             }
