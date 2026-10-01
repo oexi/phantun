@@ -178,3 +178,13 @@ pub fn assign_ipv6_address(device_name: &str, local: Ipv6Addr, peer: Ipv6Addr) {
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
+
+/// Completes when the process receives SIGINT or SIGTERM
+pub async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("unable to listen for SIGTERM");
+    tokio::select! {
+        _ = term.recv() => {},
+        _ = tokio::signal::ctrl_c() => {},
+    }
+}

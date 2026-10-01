@@ -4,6 +4,8 @@ on: [push, pull_request]
 
 env:
   CARGO_TERM_COLOR: always
+  # The runners have clang, so the eBPF program must build
+  PHANTUN_REQUIRE_EBPF: 1
 
 jobs:
   build:
@@ -24,7 +26,21 @@ jobs:
       run: cargo fmt --all --check
     - name: Run lint
       run: cargo clippy --all-targets --locked -- -D warnings
+    - name: Run lint without eBPF
+      run: cargo clippy --all-targets --locked -- -D warnings
+      env:
+        CLANG: none
+        PHANTUN_REQUIRE_EBPF: 0
     - name: Run tests
       run: cargo test --locked
     - name: Build
       run: cargo build --locked
+    - name: Test the eBPF data path
+      run: |
+        # The tc modules may only come with the extra modules package
+        if ! sudo modprobe -a cls_bpf act_csum sch_ingress sch_netem; then
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r)
+          sudo modprobe -a cls_bpf act_csum sch_ingress sch_netem
+        fi
+        sudo tests/ebpf.sh target/debug

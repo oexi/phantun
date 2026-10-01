@@ -29,3 +29,7 @@ rand = "0"
 # CPUs lack
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
+
+# The eBPF data path, aya does not support 32-bit x86
+[target.'cfg(not(target_arch = "x86"))'.dependencies]
+aya = { version = "0.14", default-features = false }

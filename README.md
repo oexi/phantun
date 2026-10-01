@@ -28,6 +28,9 @@ A lightweight and fast UDP to TCP obfuscator.
 * [Forward error correction (FEC)](#forward-error-correction-fec)
     * [Burst loss](#burst-loss)
     * [Statistics](#statistics)
+* [eBPF data path](#ebpf-data-path)
+    * [Requirements](#requirements)
+    * [Changes to the host](#changes-to-the-host)
 * [Version compatibility](#version-compatibility)
 * [Documentations](#documentations)
 * [Performance](#performance)
@@ -194,11 +197,12 @@ ip6tables -t nat -A PREROUTING -p tcp -i eth0 --dport 4567 -j DNAT --to-destinat
 ## 3. Run Phantun binaries as non-root (Optional)
 
 It is ill-advised to run network facing applications as root user. Phantun can be run fully
-as non-root user with the `cap_net_admin` capability.
+as non-root user with the `cap_net_admin` capability, and `cap_bpf` for the
+[eBPF data path](#ebpf-data-path).
 
 ```
-sudo setcap cap_net_admin=+pe phantun_server
-sudo setcap cap_net_admin=+pe phantun_client
+sudo setcap cap_net_admin,cap_bpf=+pe phantun_server
+sudo setcap cap_net_admin,cap_bpf=+pe phantun_client
 ```
 
 
@@ -375,7 +379,7 @@ only applies to the parity sent by the end it is set on.
 ## Statistics
 
 Each end logs the packets of every connection every `--fec-stats` seconds, and once more for the
-whole connection when it closes, though not when phantun itself is stopped:
+whole connection when it closes, or when phantun is stopped with SIGTERM or SIGINT:
 
 ```
 FEC stats of (Fake TCP connection from 192.168.201.2:4567 to 10.0.0.2:40000) in the last 300s:
@@ -388,6 +392,74 @@ direction towards this end, which the peer's `K:M` has to cope with. Raise `M` w
 still lost after FEC, and lower it when the loss before FEC is well below what `K:M` is meant for.
 Lost packets at the end of a group are only noticed when a parity packet of that group arrives, so
 losses after FEC may be slightly undercounted.
+
+[Back to TOC](#table-of-contents)
+
+# eBPF data path
+
+Normally, every packet passes through Phantun: it reads the fake TCP packets from the Tun
+interface and sends their payload from a UDP socket, and the other way around. On Linux hosts that
+support it, Phantun instead lets eBPF programs convert the packets of established connections
+inside the kernel, which no longer have to be copied to and from Phantun. This is used
+automatically, nothing needs to be configured, and the packets on the wire are the same, so either
+end may use it regardless of what the other end does.
+
+In a test with WireGuard over Phantun between two network namespaces of a 4 core ARM VM, with
+20 ms of round trip time added between them, `iperf3` reached:
+
+| Phantun                            | Throughput   | TCP retransmissions |
+|------------------------------------|--------------|---------------------|
+| v0.8.1                             | 459 Mbit/s   | 38844               |
+| eBPF data path                     | 1.05 Gbit/s  | 0                   |
+| FEC `10:2`, 1% loss, without eBPF  | 347 Mbit/s   | 15387               |
+| FEC `10:2`, 1% loss, eBPF          | 910 Mbit/s   | 33                  |
+
+With [FEC](#forward-error-correction-fec), the programs convert data shards and pass a copy of
+them to Phantun, which computes the parity shards from them and recovers lost data shards, so only
+parity shards and recovered datagrams pass through Phantun.
+
+Phantun logs whether it is used, once at startup and then for each connection:
+
+```
+INFO  phantun::offload > eBPF data path enabled
+INFO  phantun::offload > Packets of (Fake TCP connection from 192.168.201.2:4567 to 10.0.0.2:40000) are converted by eBPF
+```
+
+With FEC, the second line ends in `are converted by eBPF, with FEC computed by Phantun`.
+
+Otherwise, the log says why not, and Phantun works as before, e.g. on RouterOS or in containers
+without the privileges needed. `--no-ebpf` disables it.
+
+Handshakes, RSTs, packets merged by GRO and anything unusual still go through Phantun, so the
+[firewall rules](#2-add-required-firewall-rules) are needed all the same. To keep the receiving
+kernel from merging data packets with GRO, Phantun now sets the PSH flag on them, which older
+versions ignore.
+
+## Requirements
+
+* Linux 5.12 or newer, with the `cls_bpf`, `act_csum` and `sch_ingress` (clsact) tc modules,
+  which distributions ship.
+* Root, or the `cap_net_admin` and `cap_bpf` capabilities:
+  `sudo setcap cap_net_admin,cap_bpf=+pe phantun_server`.
+* The UDP peer of a connection has to be on the same host (in the same network namespace), e.g.
+  WireGuard listening on `127.0.0.1`, as the programs only deliver datagrams locally. Connections
+  with peers on other hosts go through Phantun.
+* With [FEC](#forward-error-correction-fec), a 64-bit platform or one with 64-bit atomics, so
+  not MIPS32.
+* Phantun built with clang 12 or newer installed. The release binaries and the Docker image are,
+  except for 32-bit x86, which the eBPF library does not support. Building without clang leaves the
+  eBPF data path out with a warning, `PHANTUN_REQUIRE_EBPF=1` turns that into an error.
+
+## Changes to the host
+
+* A `clsact` qdisc is added to the Tun and the loopback interface, which stays on loopback.
+* Two tc filters named `phantun:<tun name>` are added to ingress of loopback, at priorities 28776
+  and 28777. Phantun removes them when it receives SIGTERM or SIGINT. If it is killed, they do
+  nothing until the next instance removes them.
+* `net.ipv4.conf.lo.route_localnet` and `net.ipv4.conf.lo.accept_local` are set to 1 and not
+  reverted. Without them, the kernel drops IPv4 datagrams that the programs deliver to local
+  addresses. They only affect packets entering the loopback interface without a route, which
+  happens when they are redirected there like these, not to ordinary local traffic.
 
 [Back to TOC](#table-of-contents)
 

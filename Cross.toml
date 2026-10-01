@@ -1,0 +1,3 @@
+# The eBPF program is built outside of the images of cross, see .github/workflows/release.yml
+[build.env]
+passthrough = ["PHANTUN_BPF_OBJECT_DIR", "PHANTUN_REQUIRE_EBPF"]
