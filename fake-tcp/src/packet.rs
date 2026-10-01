@@ -127,25 +127,80 @@ pub fn build_tcp_packet(
     ip_buf.freeze()
 }
 
+/// Parses a TCP packet, `None` if it is something else or malformed
 pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {
-    if buf[0] >> 4 == 4 {
-        let v4 = ipv4::Ipv4Packet::new(buf).unwrap();
+    let version = buf.first()? >> 4;
+    if version == 4 {
+        let v4 = ipv4::Ipv4Packet::new(buf)?;
         if v4.get_next_level_protocol() != ip::IpNextHeaderProtocols::Tcp {
             return None;
         }
 
-        let tcp = tcp::TcpPacket::new(&buf[IPV4_HEADER_LEN..]).unwrap();
+        // the header may have options
+        let header_len = v4.get_header_length() as usize * 4;
+        if header_len < IPV4_HEADER_LEN {
+            return None;
+        }
+        let tcp = tcp::TcpPacket::new(buf.get(header_len..)?)?;
         Some((IPPacket::V4(v4), tcp))
-    } else if buf[0] >> 4 == 6 {
-        let v6 = ipv6::Ipv6Packet::new(buf).unwrap();
+    } else if version == 6 {
+        let v6 = ipv6::Ipv6Packet::new(buf)?;
         if v6.get_next_header() != ip::IpNextHeaderProtocols::Tcp {
             return None;
         }
 
-        let tcp = tcp::TcpPacket::new(&buf[IPV6_HEADER_LEN..]).unwrap();
+        let tcp = tcp::TcpPacket::new(buf.get(IPV6_HEADER_LEN..)?)?;
         Some((IPPacket::V6(v6), tcp))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ipv4_options() {
+        let local = "192.168.201.2:4567".parse().unwrap();
+        let remote = "10.0.0.1:40000".parse().unwrap();
+        let packet = build_tcp_packet(local, remote, 123, 456, tcp::TcpFlags::ACK, Some(b"data"));
+
+        // insert 4 bytes of options (NOP, NOP, NOP, EOL) into the IPv4 header
+        let mut buf = packet[..IPV4_HEADER_LEN].to_vec();
+        buf.extend_from_slice(&[1, 1, 1, 0]);
+        buf.extend_from_slice(&packet[IPV4_HEADER_LEN..]);
+        buf[0] = 0x46;
+        let total_len = (buf.len() as u16).to_be_bytes();
+        buf[2..4].copy_from_slice(&total_len);
+        let buf = Bytes::from(buf);
+
+        let (ip, tcp) = parse_ip_packet(&buf).unwrap();
+        assert_eq!(ip.get_source(), local.ip());
+        assert_eq!(ip.get_destination(), remote.ip());
+        assert_eq!(tcp.get_source(), local.port());
+        assert_eq!(tcp.get_destination(), remote.port());
+        assert_eq!(tcp.get_sequence(), 123);
+        assert_eq!(tcp.get_acknowledgement(), 456);
+        assert_eq!(tcp.payload(), b"data");
+    }
+
+    #[test]
+    fn parse_malformed() {
+        let local = "192.168.201.2:4567".parse().unwrap();
+        let remote = "10.0.0.1:40000".parse().unwrap();
+        let packet = build_tcp_packet(local, remote, 123, 456, tcp::TcpFlags::ACK, None);
+
+        // truncated anywhere, or with a header length beyond the packet
+        for len in 0..packet.len() {
+            assert!(
+                parse_ip_packet(&packet.slice(..len)).is_none(),
+                "{len} bytes"
+            );
+        }
+        let mut buf = packet.to_vec();
+        buf[0] = 0x4f;
+        assert!(parse_ip_packet(&Bytes::from(buf)).is_none());
     }
 }
 
