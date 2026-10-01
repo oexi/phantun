@@ -34,7 +34,7 @@ cleanup() {
 trap cleanup EXIT
 
 cat > "$WORK/echo.py" <<'EOF'
-import socket, sys
+import socket, sys, time
 
 def server(host, port):
     s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
@@ -62,10 +62,34 @@ def client(host, port, count, size):
             pass
     print(ok)
 
-if sys.argv[1] == "server":
-    server(sys.argv[2], int(sys.argv[3]))
-else:
-    client(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+# Counts datagrams until "end", and replies with the count
+def sink(host, port):
+    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((host, port))
+    n = 0
+    while True:
+        data, addr = s.recvfrom(4096)
+        if data == b"end":
+            s.sendto(b"%d" % n, addr)
+            n = 0
+        else:
+            n += 1
+
+# Sends datagrams one way, then "end", and prints how many arrived
+def oneway(host, port, count, size):
+    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2)
+    s.connect((host, port))
+    for i in range(count):
+        s.send(bytes(size))
+        time.sleep(0.001)
+    s.send(b"end")
+    try:
+        print(int(s.recv(64)))
+    except socket.timeout:
+        print(0)
+
+globals()[sys.argv[1]](sys.argv[2], *map(int, sys.argv[3:]))
 EOF
 
 setup() {
@@ -92,9 +116,15 @@ setup() {
   ip netns exec $NS_C ip6tables -t nat -A POSTROUTING -s fcc8::2 -o phantun-tc -j MASQUERADE
   ip netns exec $NS_S iptables -t nat -A PREROUTING -p tcp -i phantun-ts --dport 4567 -j DNAT --to-destination 192.168.201.2
   ip netns exec $NS_S ip6tables -t nat -A PREROUTING -p tcp -i phantun-ts --dport 4567 -j DNAT --to-destination fcc9::2
+  # Like a real network, drop what the other end sends without NAT
+  ip netns exec $NS_S iptables -t raw -A PREROUTING -s 192.168.200.0/24 -j DROP
+  ip netns exec $NS_S ip6tables -t raw -A PREROUTING -s fcc8::/64 -j DROP
+  ip netns exec $NS_C iptables -t raw -A PREROUTING -s 192.168.201.0/24 -j DROP
+  ip netns exec $NS_C ip6tables -t raw -A PREROUTING -s fcc9::/64 -j DROP
 
   ip netns exec $NS_S python3 "$WORK/echo.py" server 127.0.0.1 7777 &
   ip netns exec $NS_S python3 "$WORK/echo.py" server ::1 7777 &
+  ip netns exec $NS_S python3 "$WORK/echo.py" sink 127.0.0.1 7778 &
 }
 
 # setup_wg: a WireGuard link between both namespaces, over the veth link, for fake TCP
@@ -195,6 +225,37 @@ run() {
   done
 }
 
+# oneway <name> [phantun args]: datagrams that only go from the client to the server, more than
+# the 64 KB that conntrack lets through from the client until it sees a packet from the server
+# after the handshake, as the window of the SYN + ACK is not scaled
+oneway() {
+  local name=$1
+  shift
+  echo "=== $name"
+  ip netns exec $NS_S env RUST_LOG=info "$BIN_DIR/server" --local 4567 --remote 127.0.0.1:7778 --tun phantun-ts0 "$@" \
+    > "$WORK/server.log" 2>&1 &
+  ip netns exec $NS_C env RUST_LOG=info "$BIN_DIR/client" --local 127.0.0.1:1984 --remote 10.199.0.2:4567 --tun phantun-tc0 "$@" \
+    > "$WORK/client.log" 2>&1 &
+  sleep 1
+
+  local ok
+  ok=$(ip netns exec $NS_C python3 "$WORK/echo.py" oneway 127.0.0.1 1984 $COUNT 1000)
+
+  pkill -f "^$BIN_DIR/(server|client) " || true
+  sleep 0.5
+
+  local result=pass
+  if [ "$ok" -lt $((COUNT - 5)) ]; then
+    result=fail
+    failed=1
+  fi
+  echo "received $ok/$COUNT: $result"
+  if [ $result = fail ]; then
+    echo "--- server log"; cat "$WORK/server.log"
+    echo "--- client log"; cat "$WORK/client.log"
+  fi
+}
+
 setup
 run "IPv4" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic
 run "IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic
@@ -203,6 +264,9 @@ run "IPv4 fake TCP, IPv6 UDP" 10.199.0.2:4567 "[::1]:7777" "[::1]:1984" nic
 run "IPv4, --no-ebpf-nic" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 tun --no-ebpf-nic
 run "IPv6, --no-ebpf-nic" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" tun --no-ebpf-nic
 run "--no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --no-ebpf
+# Through conntrack on both ends
+oneway "One way, --no-ebpf-nic" --no-ebpf-nic
+oneway "One way, --no-ebpf" --no-ebpf
 loss 5
 run "FEC with 5% loss" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic --fec 4:2
 run "FEC with 5% loss, IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic --fec 4:2
