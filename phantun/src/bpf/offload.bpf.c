@@ -5,21 +5,39 @@
 // Phantun normally moves every packet through user space: fake TCP packets are read from the Tun
 // interface and their payload is sent from a UDP socket, and datagrams received on that socket are
 // written to the Tun interface as fake TCP packets. Once user space has registered a connection in
-// the maps below, these programs do the same conversion inside the kernel:
+// the maps below, these programs do the same conversion inside the kernel, in one of two ways.
+//
+// Like mimic, on the network interface the fake TCP packets of the connection use, which leaves
+// out the Tun interface, routing and netfilter:
+//
+// - nic_ingress_eth and nic_ingress_l3, on ingress of the network interface (with an Ethernet
+//   header or without one), turn fake TCP packets from the other end into the UDP datagrams
+//   Phantun would have sent. The other packets of the connection, which Phantun handles, are
+//   passed to it on the Tun interface, with the addresses they would have had after netfilter's
+//   NAT, which never sees them.
+// - udp_to_tcp, on ingress of the loopback interface, turns datagrams that local applications
+//   send to Phantun into the fake TCP packets Phantun would have written to the Tun interface, with
+//   the addresses they would have had after NAT, and sends them out of the network interface.
+// - tun_ingress, on ingress of the Tun interface, does the same with the fake TCP packets Phantun
+//   writes itself, such as ACKs, RSTs and FEC parity shards.
+//
+// User space finds the addresses after NAT in conntrack. Where the network interface cannot be
+// used, the conversion happens on the Tun interface, and the kernel routes and NATs the packets:
 //
 // - tcp_to_udp, on egress of the Tun interface, turns fake TCP packets that the kernel is about to
 //   hand to Phantun into the UDP datagrams Phantun would have sent, and
-// - udp_to_tcp, on ingress of the loopback interface, turns datagrams that local applications send
-//   to Phantun into the fake TCP packets Phantun would have written to the Tun interface.
+// - udp_to_tcp turns datagrams into the fake TCP packets that enter the Tun interface as if
+//   Phantun had written them.
 //
 // The IP version may differ between both sides, e.g. fake TCP over IPv6 for an application on
 // 127.0.0.1.
 //
-// Both are classifiers without direct action. A converted packet runs the filter's csum action,
-// which computes the checksums in software and clears CHECKSUM_PARTIAL (eBPF cannot move the
-// offloaded checksum from the UDP to the TCP header), and is then redirected by the `redirect`
-// program of a later filter: to loopback ingress, so the datagram is received like one sent by
-// Phantun, or to Tun ingress, so the packet is routed like one written by Phantun.
+// The converting programs are classifiers without direct action. A converted packet runs the
+// filter's csum action, which computes the checksums in software and clears CHECKSUM_PARTIAL (eBPF
+// cannot move the offloaded checksum from the UDP to the TCP header), and is then redirected by the
+// `redirect` program of a later filter: to loopback ingress, so the datagram is received like one
+// sent by Phantun, to Tun ingress, so the packet is routed like one written by Phantun, or out of
+// the network interface, with the Ethernet header from the neighbour table.
 //
 // Anything else, such as handshakes, RSTs, GRO/GSO packets, IP options or fragments, is left
 // alone and keeps taking the user space path. The sequence numbers live in an array that user
@@ -39,6 +57,7 @@ typedef unsigned short __u16;
 typedef unsigned int __u32;
 typedef unsigned long long __u64;
 typedef signed int __s32;
+typedef signed long long __s64;
 typedef __u16 __be16;
 typedef __u32 __be32;
 
@@ -112,6 +131,8 @@ struct __sk_buff {
 #define BPF_F_MMAPABLE (1U << 10)
 #define BPF_F_INGRESS (1ULL << 0)
 #define BPF_ADJ_ROOM_NET 0
+#define BPF_F_PSEUDO_HDR (1ULL << 4)
+
 
 #define TC_ACT_UNSPEC (-1)
 #define TC_ACT_SHOT 2
@@ -147,6 +168,15 @@ static long (*bpf_skb_load_bytes)(const void *skb, __u32 offset, void *to, __u32
 static long (*bpf_skb_change_head)(struct __sk_buff *skb, __u32 len, __u64 flags) = (void *)43;
 static long (*bpf_skb_adjust_room)(struct __sk_buff *skb, __s32 len_diff, __u32 mode,
 				   __u64 flags) = (void *)50;
+static long (*bpf_l3_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to,
+				   __u64 size) = (void *)10;
+static long (*bpf_l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to,
+				   __u64 flags) = (void *)11;
+static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to, __u32 to_size,
+			      __u32 seed) = (void *)28;
+static long (*bpf_redirect_neigh)(__u32 ifindex, void *params, int plen, __u64 flags) = (void *)152;
+static long (*bpf_check_mtu)(void *ctx, __u32 ifindex, __u32 *mtu_len, __s32 len_diff,
+			     __u64 flags) = (void *)163;
 static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) = (void *)131;
 static void (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *)132;
 static void (*bpf_ringbuf_discard)(void *data, __u64 flags) = (void *)133;
@@ -192,7 +222,7 @@ struct udphdr {
 	__u16 check;
 };
 
-// The structures below are shared with user space (src/offload.rs)
+// The structures below are shared with user space (src/offload/imp.rs)
 
 // Addresses and ports of a packet. IPv4 addresses only use the first word, the rest is zero.
 struct tuple {
@@ -203,14 +233,26 @@ struct tuple {
 	__u32 family; // 4 or 6
 };
 
+// The fake TCP packets of the connection are on a network interface rather than the Tun interface
+#define CONV_NIC 1
+
 // What a matching packet is turned into
 struct conversion {
 	struct tuple out;
+	// For fake TCP packets on a network interface: their addresses on the Tun interface, for the
+	// packets passed to user space there
+	struct tuple tun;
 	__u32 slot; // index into `states`
 	// Identifies the connection in records, when it uses FEC, otherwise 0
 	__u32 fec_id;
 	// K, the number of data shards in a full FEC group
 	__u32 fec_data_shards;
+	// CONV_*
+	__u32 flags;
+	// Where the packets go: for udp_conversions and tun_conversions the network interface with
+	// CONV_NIC and the Tun interface otherwise, for tcp_conversions with CONV_NIC the Tun
+	// interface, for the packets passed to user space
+	__u32 ifindex;
 	__u32 _pad;
 };
 
@@ -259,10 +301,10 @@ struct record {
 
 #define MAX_CONNECTIONS 4096
 
-// fake TCP packets that tcp_to_udp turns into datagrams, by their addresses
+// Fake TCP packets that tcp_to_udp and nic_ingress_* turn into datagrams, by their addresses
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_CONNECTIONS);
+	__uint(max_entries, 2 * MAX_CONNECTIONS);
 	__type(key, struct tuple);
 	__type(value, struct conversion);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -276,6 +318,16 @@ struct {
 	__type(value, struct conversion);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } udp_conversions SEC(".maps");
+
+// Fake TCP packets of user space that tun_ingress sends out of a network interface, by their
+// addresses on the Tun interface. Only `out` and `ifindex` are used.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_CONNECTIONS);
+	__type(key, struct tuple);
+	__type(value, struct conversion);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} tun_conversions SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -291,13 +343,19 @@ struct {
 	__uint(max_entries, 4096);
 } records SEC(".maps");
 
-// Set by user space before loading
-volatile const __u32 tun_ifindex = 0;
-
 // A converted packet is marked in the control block for the redirect program. The control block
-// is not cleared between layers, so the mark is long enough to never match by accident.
-#define MARK_MAGIC 0x7068616e // "phan"
+// is not cleared between layers, so the mark is long enough to never match by accident. The
+// value differs from that of earlier versions, as their redirect programs may be on the same
+// loopback interface, and do not know all the flags.
+#define MARK_MAGIC 0x70686e32 // "phn2"
+// Push an Ethernet header for loopback, the packet has none
 #define MARK_PUSH_ETH 1
+// Replace the Ethernet header with one for loopback
+#define MARK_LOOPBACK_ETH 2
+// Redirect to egress rather than ingress
+#define MARK_EGRESS 4
+// Redirect to egress, with the Ethernet header from the neighbour table
+#define MARK_NEIGH 8
 
 static __always_inline void mark(struct __sk_buff *skb, __u32 ifindex, __u32 flags)
 {
@@ -316,12 +374,9 @@ struct headers {
 	struct tuple tuple;
 };
 
-// Parses an IP header without options or fragmentation, at `off` of a packet that is not GSO
+// Parses an IP header without options or fragmentation at `off`
 static __always_inline int parse_ip(struct __sk_buff *skb, __u32 off, struct headers *h)
 {
-	if (skb->gso_size)
-		return -1;
-
 	h->l3_off = off;
 	if (skb->protocol == bpf_htons(ETH_P_IP)) {
 		struct iphdr ip;
@@ -358,6 +413,19 @@ static __always_inline int parse_ip(struct __sk_buff *skb, __u32 off, struct hea
 	return 0;
 }
 
+// Parses a TCP packet at `off`, and looks up its conversion in `map`
+static __always_inline struct conversion *lookup_tcp(struct __sk_buff *skb, __u32 off, void *map,
+						     struct headers *h, struct tcphdr *tcp)
+{
+	if (parse_ip(skb, off, h) || h->protocol != IPPROTO_TCP)
+		return 0;
+	if (bpf_skb_load_bytes(skb, h->l4_off, tcp, sizeof(*tcp)))
+		return 0;
+	h->tuple.sport = tcp->source;
+	h->tuple.dport = tcp->dest;
+	return bpf_map_lookup_elem(map, &h->tuple);
+}
+
 static __always_inline __u32 ip_header_len(__u32 family)
 {
 	return family == 4 ? sizeof(struct iphdr) : sizeof(struct ipv6hdr);
@@ -391,6 +459,50 @@ static __always_inline int write_ip(struct __sk_buff *skb, __u32 off, const stru
 	__builtin_memcpy(ip6.saddr, out->saddr, sizeof(ip6.saddr));
 	__builtin_memcpy(ip6.daddr, out->daddr, sizeof(ip6.daddr));
 	return bpf_skb_store_bytes(skb, off, &ip6, sizeof(ip6), 0);
+}
+
+// Changes the addresses and ports of the TCP packet `h` to those of `to`, of the same IP version.
+// The checksums are updated incrementally, which works for any checksum state, including the
+// partial checksum of GRO packets.
+static __always_inline int rewrite_tcp(struct __sk_buff *skb, const struct headers *h,
+				       const struct tuple *to)
+{
+	__be16 old_ports[2] = {h->tuple.sport, h->tuple.dport};
+	__be16 new_ports[2] = {to->sport, to->dport};
+	__u32 check_off = h->l4_off + __builtin_offsetof(struct tcphdr, check);
+	__s64 diff;
+
+	if (h->family == 4) {
+		__be32 old[2] = {h->tuple.saddr[0], h->tuple.daddr[0]};
+		__be32 new[2] = {to->saddr[0], to->daddr[0]};
+		diff = bpf_csum_diff(old, sizeof(old), new, sizeof(new), 0);
+		if (diff < 0 ||
+		    bpf_skb_store_bytes(skb, h->l3_off + __builtin_offsetof(struct iphdr, saddr), new,
+					sizeof(new), 0) ||
+		    bpf_l3_csum_replace(skb, h->l3_off + __builtin_offsetof(struct iphdr, check), 0,
+					diff, 0))
+			return -1;
+	} else {
+		__be32 old[8], new[8];
+		__builtin_memcpy(old, h->tuple.saddr, 16);
+		__builtin_memcpy(old + 4, h->tuple.daddr, 16);
+		__builtin_memcpy(new, to->saddr, 16);
+		__builtin_memcpy(new + 4, to->daddr, 16);
+		diff = bpf_csum_diff(old, sizeof(old), new, sizeof(new), 0);
+		if (diff < 0 ||
+		    bpf_skb_store_bytes(skb, h->l3_off + __builtin_offsetof(struct ipv6hdr, saddr),
+					new, sizeof(new), 0))
+			return -1;
+	}
+	// The addresses are part of the pseudo header, the ports are not
+	if (bpf_l4_csum_replace(skb, check_off, 0, diff, BPF_F_PSEUDO_HDR))
+		return -1;
+	diff = bpf_csum_diff((__be32 *)old_ports, sizeof(old_ports), (__be32 *)new_ports,
+			     sizeof(new_ports), 0);
+	if (diff < 0 || bpf_skb_store_bytes(skb, h->l4_off, new_ports, sizeof(new_ports), 0) ||
+	    bpf_l4_csum_replace(skb, check_off, 0, diff, 0))
+		return -1;
+	return 0;
 }
 
 // Makes room for the headers of the converted packet: changes the IP version if the conversion
@@ -440,29 +552,18 @@ static __always_inline int fec_claim(struct state *s, __u32 data_shards, __u32 *
 	return -1;
 }
 
-// Egress of the Tun interface, so the packet starts with the IP header
-SEC("classifier/tcp_to_udp")
-int tcp_to_udp(struct __sk_buff *skb)
+// Turns the fake TCP packet `h` of the connection `c` into its datagram, which the redirect
+// program then passes to loopback, with `mark_flags`. Returns CLS_NO_MATCH, leaving the packet
+// unchanged, when it is not a plain data packet that can be converted.
+static __always_inline int convert_tcp(struct __sk_buff *skb, struct headers *h,
+				       const struct tcphdr *tcp, const struct conversion *c,
+				       __u32 mark_flags)
 {
-	struct headers h = {};
-	struct tcphdr tcp;
-
-	if (parse_ip(skb, 0, &h) || h.protocol != IPPROTO_TCP)
-		return CLS_NO_MATCH;
-	if (bpf_skb_load_bytes(skb, h.l4_off, &tcp, sizeof(tcp)))
-		return CLS_NO_MATCH;
-	h.tuple.sport = tcp.source;
-	h.tuple.dport = tcp.dest;
-
-	struct conversion *c = bpf_map_lookup_elem(&tcp_conversions, &h.tuple);
-	if (!c)
-		return CLS_NO_MATCH;
-
 	// Only plain data packets, everything else is for user space. PSH is optional, see
 	// Socket::send.
-	if (tcp.doff != 0x50 || (tcp.flags & ~TCP_FLAG_PSH) != TCP_FLAG_ACK)
+	if (skb->gso_size || tcp->doff != 0x50 || (tcp->flags & ~TCP_FLAG_PSH) != TCP_FLAG_ACK)
 		return CLS_NO_MATCH;
-	__u32 payload_len = h.len - (h.l4_off - h.l3_off) - sizeof(tcp);
+	__u32 payload_len = h->len - (h->l4_off - h->l3_off) - sizeof(*tcp);
 	if (payload_len == 0 || payload_len > MAX_PACKET_LEN)
 		return CLS_NO_MATCH;
 
@@ -471,13 +572,13 @@ int tcp_to_udp(struct __sk_buff *skb)
 	if (!s)
 		return CLS_NO_MATCH;
 
-	__u32 ack = bpf_ntohl(tcp.seq) + payload_len;
+	__u32 ack = bpf_ntohl(tcp->seq) + payload_len;
 	// Too much has not been acknowledged, let user space send an ACK
 	if (ack - *(volatile __u32 *)&s->last_ack > MAX_UNACKED_LEN)
 		return CLS_NO_MATCH;
 
 	struct tuple out = c->out;
-	__u32 payload_off = h.l4_off + sizeof(tcp);
+	__u32 payload_off = h->l4_off + sizeof(*tcp);
 	// Bytes removed in front of the UDP header: the first 12 bytes of the TCP header, its last 8
 	// bytes become the UDP header
 	__u32 strip = HEADER_DIFF;
@@ -522,7 +623,7 @@ int tcp_to_udp(struct __sk_buff *skb)
 		strip += sizeof(fec);
 	}
 
-	int ret = make_room(skb, &h, &out, -(__s32)strip);
+	int ret = make_room(skb, h, &out, -(__s32)strip);
 	if (ret < 0) {
 		if (rec)
 			bpf_ringbuf_discard(rec, 0);
@@ -539,8 +640,8 @@ int tcp_to_udp(struct __sk_buff *skb)
 	};
 	// The packet has already been changed, so it can only be dropped if these fail. That does not
 	// happen though, as the bytes exist.
-	if (ret || write_ip(skb, h.l3_off, &out, IPPROTO_UDP, sizeof(udp) + payload_len) ||
-	    bpf_skb_store_bytes(skb, h.l3_off + ip_header_len(out.family), &udp, sizeof(udp), 0)) {
+	if (ret || write_ip(skb, h->l3_off, &out, IPPROTO_UDP, sizeof(udp) + payload_len) ||
+	    bpf_skb_store_bytes(skb, h->l3_off + ip_header_len(out.family), &udp, sizeof(udp), 0)) {
 		// Not delivered, so it may still be recovered
 		if (rec)
 			bpf_ringbuf_discard(rec, 0);
@@ -555,8 +656,58 @@ int tcp_to_udp(struct __sk_buff *skb)
 	if (!(*(volatile __u32 *)&s->flags & STATE_FLAG_PSH))
 		__sync_fetch_and_or(&s->flags, STATE_FLAG_PSH);
 	s->rx++;
-	mark(skb, LOOPBACK_IFINDEX, MARK_PUSH_ETH);
+	mark(skb, LOOPBACK_IFINDEX, mark_flags);
 	return CLS_MATCH;
+}
+
+// Egress of the Tun interface, so the packet starts with the IP header
+SEC("classifier/tcp_to_udp")
+int tcp_to_udp(struct __sk_buff *skb)
+{
+	struct headers h = {};
+	struct tcphdr tcp;
+
+	struct conversion *c = lookup_tcp(skb, 0, &tcp_conversions, &h, &tcp);
+	if (!c)
+		return CLS_NO_MATCH;
+	return convert_tcp(skb, &h, &tcp, c, MARK_PUSH_ETH);
+}
+
+// Ingress of a network interface whose packets start at `l3_off`
+static __always_inline int nic_ingress(struct __sk_buff *skb, __u32 l3_off, __u32 mark_flags)
+{
+	struct headers h = {};
+	struct tcphdr tcp;
+
+	struct conversion *c = lookup_tcp(skb, l3_off, &tcp_conversions, &h, &tcp);
+	if (!c || !(c->flags & CONV_NIC))
+		return CLS_NO_MATCH;
+	int ret = convert_tcp(skb, &h, &tcp, c, mark_flags);
+	if (ret != CLS_NO_MATCH)
+		return ret;
+
+	// Anything else goes to user space, on the Tun interface. Passing it up the stack instead
+	// would not work, as conntrack has not seen the packets in between, so it might consider it
+	// invalid and leave it alone rather than NAT it.
+	if (c->tun.family != h.family)
+		return CLS_NO_MATCH;
+	if (rewrite_tcp(skb, &h, &c->tun))
+		mark(skb, 0, 0);
+	else
+		mark(skb, c->ifindex, MARK_EGRESS);
+	return CLS_MATCH;
+}
+
+SEC("classifier/nic_ingress_eth")
+int nic_ingress_eth(struct __sk_buff *skb)
+{
+	return nic_ingress(skb, ETH_HLEN, MARK_LOOPBACK_ETH);
+}
+
+SEC("classifier/nic_ingress_l3")
+int nic_ingress_l3(struct __sk_buff *skb)
+{
+	return nic_ingress(skb, 0, MARK_PUSH_ETH);
 }
 
 // Ingress of the loopback interface, so the packet starts with an Ethernet header
@@ -566,7 +717,7 @@ int udp_to_tcp(struct __sk_buff *skb)
 	struct headers h = {};
 	struct udphdr udp;
 
-	if (parse_ip(skb, ETH_HLEN, &h) || h.protocol != IPPROTO_UDP)
+	if (skb->gso_size || parse_ip(skb, ETH_HLEN, &h) || h.protocol != IPPROTO_UDP)
 		return CLS_NO_MATCH;
 	if (bpf_skb_load_bytes(skb, h.l4_off, &udp, sizeof(udp)))
 		return CLS_NO_MATCH;
@@ -579,13 +730,19 @@ int udp_to_tcp(struct __sk_buff *skb)
 
 	struct tuple out = c->out;
 	__u32 fec_id = c->fec_id, data_shards = c->fec_data_shards;
+	__u32 ifindex = c->ifindex, nic = c->flags & CONV_NIC;
 	__u32 grow = HEADER_DIFF + (fec_id ? FEC_DATA_HEADER_LEN : 0);
 	__u32 payload_len = h.len - (h.l4_off - h.l3_off) - sizeof(udp);
 	if (bpf_ntohs(udp.len) != sizeof(udp) + payload_len)
 		return CLS_NO_MATCH;
 	// Phantun drops empty datagrams and truncates large ones, leave both to it
-	if (payload_len == 0 ||
-	    ip_header_len(out.family) + sizeof(udp) + grow + payload_len > MAX_PACKET_LEN)
+	__u32 tcp_len = ip_header_len(out.family) + sizeof(udp) + grow + payload_len;
+	if (payload_len == 0 || tcp_len > MAX_PACKET_LEN)
+		return CLS_NO_MATCH;
+	// The kernel would drop packets too large for the network interface without telling anyone,
+	// let user space send them, so that they are handled like before
+	__u32 mtu_len = tcp_len;
+	if (nic && bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0))
 		return CLS_NO_MATCH;
 
 	__u32 slot = c->slot;
@@ -659,8 +816,38 @@ int udp_to_tcp(struct __sk_buff *skb)
 	}
 
 	s->tx++;
-	mark(skb, tun_ifindex, 0);
+	mark(skb, ifindex, nic ? MARK_NEIGH : 0);
 	return CLS_MATCH;
+}
+
+// Writes an Ethernet header for loopback at the start of the packet, whose MAC addresses are all
+// zero, like those of loopback, so that the packet is not taken for one to another host
+static __always_inline int store_loopback_eth(struct __sk_buff *skb)
+{
+	__u8 eth[ETH_HLEN] = {};
+	__be16 proto = skb->protocol;
+	__builtin_memcpy(&eth[12], &proto, sizeof(proto));
+	return bpf_skb_store_bytes(skb, 0, eth, sizeof(eth), 0);
+}
+
+// Ingress of the Tun interface, direct action. Sends the fake TCP packets that Phantun writes for
+// connections on a network interface out of it, as udp_to_tcp does with those it converts.
+SEC("classifier/tun_ingress")
+int tun_ingress(struct __sk_buff *skb)
+{
+	struct headers h = {};
+	struct tcphdr tcp;
+
+	struct conversion *c = lookup_tcp(skb, 0, &tun_conversions, &h, &tcp);
+	if (!c || c->out.family != h.family)
+		return TC_ACT_UNSPEC;
+	__u32 ifindex = c->ifindex, mtu_len = h.len;
+	if (bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0))
+		return TC_ACT_UNSPEC;
+	if (rewrite_tcp(skb, &h, &c->out) || bpf_skb_change_head(skb, ETH_HLEN, 0) ||
+	    store_loopback_eth(skb))
+		return TC_ACT_SHOT;
+	return bpf_redirect_neigh(ifindex, 0, 0, 0);
 }
 
 // Direct action, after the converting filters
@@ -673,20 +860,19 @@ int redirect(struct __sk_buff *skb)
 		return TC_ACT_UNSPEC;
 	skb->cb[0] = 0;
 
-	if (flags & MARK_PUSH_ETH) {
-		// The target expects an Ethernet header, the addresses are those of loopback
-		__u8 eth[ETH_HLEN] = {};
-		__be16 proto = skb->protocol;
-		__builtin_memcpy(&eth[12], &proto, sizeof(proto));
-		if (bpf_skb_change_head(skb, ETH_HLEN, 0) ||
-		    bpf_skb_store_bytes(skb, 0, eth, sizeof(eth), 0))
+	if (flags & (MARK_PUSH_ETH | MARK_LOOPBACK_ETH)) {
+		if ((flags & MARK_PUSH_ETH) && bpf_skb_change_head(skb, ETH_HLEN, 0))
+			return TC_ACT_SHOT;
+		if (store_loopback_eth(skb))
 			return TC_ACT_SHOT;
 	}
 
 	// A failed conversion has no target
 	if (!ifindex)
 		return TC_ACT_SHOT;
-	return bpf_redirect(ifindex, BPF_F_INGRESS);
+	if (flags & MARK_NEIGH)
+		return bpf_redirect_neigh(ifindex, 0, 0, 0);
+	return bpf_redirect(ifindex, flags & MARK_EGRESS ? 0 : BPF_F_INGRESS);
 }
 
 char _license[] SEC("license") = "Dual MIT/GPL";

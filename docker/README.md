@@ -29,6 +29,6 @@ It is recommended to use docker-compose, see [docker-compose.yml](docker-compose
   holds more rules is used, which is the one of the host with `network_mode: host`, and `iptables-nft` if neither
   has any, unless the kernel lacks nf_tables.
 - The [eBPF data path](../README.md#ebpf-data-path) is used when the kernel supports it, which needs `privileged: true`
-  as well. With `network_mode: host` its tc filters and sysctls are those of the host, and the filters are removed
-  when the container stops. Where it is not available, e.g. on RouterOS, every packet passes through phantun as
+  as well. With `network_mode: host` its tc filters, on loopback and the network interface, and sysctls are those of
+  the host, and the filters are removed when the container stops. Where it is not available, e.g. on RouterOS, every packet passes through phantun as
   before, and the log says why.

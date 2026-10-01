@@ -1,4 +1,4 @@
-use super::tc::{self, Direction, FilterId, LOOPBACK_IFINDEX, Netlink};
+use super::netlink::{self, Direction, FilterId, LOOPBACK_IFINDEX, Netlink};
 use crate::fec::Fec;
 use aya::maps::RingBuf;
 use aya::maps::{HashMap as BpfHashMap, MapData};
@@ -33,14 +33,20 @@ struct Tuple {
     family: u32,
 }
 
+/// CONV_NIC
+const CONV_NIC: u32 = 1;
+
 /// struct conversion
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Conversion {
     out: Tuple,
+    tun: Tuple,
     slot: u32,
     fec_id: u32,
     fec_data_shards: u32,
+    flags: u32,
+    ifindex: u32,
     _pad: u32,
 }
 
@@ -70,18 +76,25 @@ const RECORD_RECEIVED_PARITY: u32 = 2;
 const RECORDS_SIZE: u32 = 8 * 1024 * 1024;
 
 const _: () = assert!(size_of::<Tuple>() == 40);
-const _: () = assert!(size_of::<Conversion>() == 56);
+const _: () = assert!(size_of::<Conversion>() == 104);
 const _: () = assert!(size_of::<State>() == 64);
 
 unsafe impl Pod for Tuple {}
 unsafe impl Pod for Conversion {}
 
-// The priorities of the filters on the loopback interface, where filters of other programs and
-// other instances of Phantun may be as well. The instances share these priorities, their filters
-// are told apart by the handle, which is the index of their Tun interface.
-const LO_CONVERT_PRIORITY: u16 = 0x7068;
-const LO_REDIRECT_PRIORITY: u16 = 0x7069;
+// The priorities of the filters on the loopback and network interfaces, where filters of other
+// programs and other instances of Phantun may be as well. The instances share these priorities,
+// their filters are told apart by the handle, which is the index of their Tun interface.
+const CONVERT_PRIORITY: u16 = 0x7068;
+const REDIRECT_PRIORITY: u16 = 0x7069;
 const FILTER_NAME_PREFIX: &str = "phantun:";
+
+// Link types (ARPHRD_*) of the network interfaces the programs support, with an Ethernet header
+// and without any
+const ARPHRD_ETHER: u16 = 1;
+const ARPHRD_PPP: u16 = 512;
+const ARPHRD_RAWIP: u16 = 519;
+const ARPHRD_NONE: u16 = 0xfffe;
 
 impl Tuple {
     /// The addresses of a packet from `src` to `dst`, unless they are of different families
@@ -175,13 +188,28 @@ impl Drop for States {
 unsafe impl Send for States {}
 unsafe impl Sync for States {}
 
+/// The programs attached to network interfaces
+struct NicPrograms {
+    /// For interfaces with an Ethernet header
+    ingress_eth: i32,
+    /// For interfaces without one
+    ingress_l3: i32,
+    redirect: i32,
+}
+
 pub struct Offload {
     tcp_conversions: Mutex<BpfHashMap<MapData, Tuple, Conversion>>,
     udp_conversions: Mutex<BpfHashMap<MapData, Tuple, Conversion>>,
+    tun_conversions: Mutex<BpfHashMap<MapData, Tuple, Conversion>>,
     states: States,
     free_slots: Mutex<Vec<u32>>,
-    /// The filters on the loopback interface, the ones on the Tun interface go with it
-    lo_filters: Mutex<Vec<FilterId>>,
+    tun: String,
+    tun_ifindex: u32,
+    /// Unless the conversion on network interfaces is disabled
+    nic_programs: Option<NicPrograms>,
+    /// The filters on the loopback and network interfaces, the ones on the Tun interface go with
+    /// it. The network interfaces get theirs once a connection uses them, by index.
+    filters: Mutex<HashMap<u32, Vec<FilterId>>>,
     /// Why IPv4 datagrams cannot be delivered, see `enable_ipv4_delivery`
     ipv4_unavailable: Option<String>,
     /// FEC records from the eBPF programs, until the task reading them is started
@@ -197,8 +225,9 @@ pub struct Offload {
 
 impl Offload {
     /// Loads the programs for the Tun interface `tun`. With `fec`, records of FEC frames are
-    /// passed to Phantun, otherwise the buffer for them is kept small.
-    pub fn new(tun: &str, fec: bool) -> Result<Offload, String> {
+    /// passed to Phantun, otherwise the buffer for them is kept small. With `nic`, the packets of
+    /// connections are converted on their network interface where possible.
+    pub fn new(tun: &str, fec: bool, nic: bool) -> Result<Offload, String> {
         let tun_ifindex = if_index(tun).ok_or_else(|| format!("no interface {tun}"))?;
         // a power of two and a multiple of the page size
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u32;
@@ -209,13 +238,19 @@ impl Offload {
         };
 
         let mut ebpf = EbpfLoader::new()
-            .override_global("tun_ifindex", &tun_ifindex, true)
             .map_max_entries("records", records_size)
             .load(OBJECT)
             .map_err(|e| format!("unable to load the eBPF programs: {e}"))?;
 
         let mut fds = Vec::new();
-        for name in ["tcp_to_udp", "udp_to_tcp", "redirect"] {
+        for name in [
+            "tcp_to_udp",
+            "udp_to_tcp",
+            "redirect",
+            "tun_ingress",
+            "nic_ingress_eth",
+            "nic_ingress_l3",
+        ] {
             let prog: &mut SchedClassifier = ebpf
                 .program_mut(name)
                 .unwrap()
@@ -234,7 +269,15 @@ impl Offload {
             })?;
             fds.push(prog.fd().unwrap().as_fd().as_raw_fd());
         }
-        let [tcp_to_udp, udp_to_tcp, redirect] = fds[..] else {
+        let [
+            tcp_to_udp,
+            udp_to_tcp,
+            redirect,
+            tun_ingress,
+            nic_ingress_eth,
+            nic_ingress_l3,
+        ] = fds[..]
+        else {
             unreachable!()
         };
 
@@ -243,6 +286,7 @@ impl Offload {
         };
         let tcp_conversions = take_hash_map(&mut ebpf, "tcp_conversions")?;
         let udp_conversions = take_hash_map(&mut ebpf, "udp_conversions")?;
+        let tun_conversions = take_hash_map(&mut ebpf, "tun_conversions")?;
         let states = match ebpf.take_map("states").unwrap() {
             aya::maps::Map::Array(map) => States::new(map)?,
             _ => unreachable!(),
@@ -253,9 +297,17 @@ impl Offload {
         let mut offload = Offload {
             tcp_conversions: Mutex::new(tcp_conversions),
             udp_conversions: Mutex::new(udp_conversions),
+            tun_conversions: Mutex::new(tun_conversions),
             states,
             free_slots: Mutex::new((0..MAX_CONNECTIONS).rev().collect()),
-            lo_filters: Mutex::new(Vec::new()),
+            tun: tun.to_string(),
+            tun_ifindex,
+            nic_programs: nic.then_some(NicPrograms {
+                ingress_eth: nic_ingress_eth,
+                ingress_l3: nic_ingress_l3,
+                redirect,
+            }),
+            filters: Mutex::new(HashMap::new()),
             ipv4_unavailable: None,
             records: Mutex::new(Some(records)),
             fec_connections: Mutex::new(HashMap::new()),
@@ -263,7 +315,7 @@ impl Offload {
             _ebpf: ebpf,
         };
         // On failure, dropping `offload` removes the filters attached so far
-        offload.attach(tun, tun_ifindex, tcp_to_udp, udp_to_tcp, redirect)?;
+        offload.attach(tcp_to_udp, udp_to_tcp, redirect, tun_ingress)?;
 
         offload.ipv4_unavailable = enable_ipv4_delivery().err();
         if let Some(ref e) = offload.ipv4_unavailable {
@@ -272,22 +324,26 @@ impl Offload {
         Ok(offload)
     }
 
+    fn filter_name(&self) -> String {
+        format!("{FILTER_NAME_PREFIX}{}", self.tun)
+    }
+
     fn attach(
         &self,
-        tun: &str,
-        tun_ifindex: u32,
         tcp_to_udp: i32,
         udp_to_tcp: i32,
         redirect: i32,
+        tun_ingress: i32,
     ) -> Result<(), String> {
         let mut nl = Netlink::new().map_err(|e| format!("netlink: {e}"))?;
-        let name = format!("{FILTER_NAME_PREFIX}{tun}");
+        let name = self.filter_name();
+        let tun_ifindex = self.tun_ifindex;
 
         for ifindex in [tun_ifindex, LOOPBACK_IFINDEX] {
             nl.add_clsact(ifindex)
                 .map_err(|e| format!("unable to add a clsact qdisc: {e}"))?;
         }
-        remove_stale_filters(&mut nl);
+        remove_stale_filters(&mut nl, LOOPBACK_IFINDEX);
 
         let filter = |ifindex, direction, priority, handle| FilterId {
             ifindex,
@@ -295,48 +351,114 @@ impl Offload {
             priority,
             handle,
         };
-        let filters = [
+        let mut filters = vec![
             (
                 filter(tun_ifindex, Direction::Egress, 1, 1),
                 tcp_to_udp,
-                Some(tc::TCA_CSUM_UPDATE_FLAG_IPV4HDR | tc::TCA_CSUM_UPDATE_FLAG_UDP),
+                Some(netlink::TCA_CSUM_UPDATE_FLAG_IPV4HDR | netlink::TCA_CSUM_UPDATE_FLAG_UDP),
             ),
             (filter(tun_ifindex, Direction::Egress, 2, 1), redirect, None),
             (
                 filter(
                     LOOPBACK_IFINDEX,
                     Direction::Ingress,
-                    LO_CONVERT_PRIORITY,
+                    CONVERT_PRIORITY,
                     tun_ifindex,
                 ),
                 udp_to_tcp,
-                Some(tc::TCA_CSUM_UPDATE_FLAG_IPV4HDR | tc::TCA_CSUM_UPDATE_FLAG_TCP),
+                Some(netlink::TCA_CSUM_UPDATE_FLAG_IPV4HDR | netlink::TCA_CSUM_UPDATE_FLAG_TCP),
             ),
             (
                 filter(
                     LOOPBACK_IFINDEX,
                     Direction::Ingress,
-                    LO_REDIRECT_PRIORITY,
+                    REDIRECT_PRIORITY,
                     tun_ifindex,
                 ),
                 redirect,
                 None,
             ),
         ];
+        if self.nic_programs.is_some() {
+            filters.push((
+                filter(tun_ifindex, Direction::Ingress, 1, 1),
+                tun_ingress,
+                None,
+            ));
+        }
         for (id, fd, csum_flags) in filters {
             nl.add_bpf_filter(id, fd, &name, csum_flags)
                 .map_err(|e| format!("unable to attach a tc filter: {e}"))?;
             if id.ifindex == LOOPBACK_IFINDEX {
-                self.lo_filters.lock().unwrap().push(id);
+                self.filters
+                    .lock()
+                    .unwrap()
+                    .entry(id.ifindex)
+                    .or_default()
+                    .push(id);
             }
         }
         Ok(())
     }
 
-    /// Removes the filters from the loopback interface, after which nothing is converted any
-    /// more. Phantun calls this before it exits, as the filters stay otherwise.
+    /// Attaches the programs to the network interface `ifindex`, unless they are already
+    fn attach_nic(&self, nl: &mut Netlink, ifindex: u32, eth: bool) -> Result<(), String> {
+        let programs = self.nic_programs.as_ref().unwrap();
+        let mut filters = self.filters.lock().unwrap();
+        if filters.contains_key(&ifindex) {
+            return Ok(());
+        }
+
+        nl.add_clsact(ifindex)
+            .map_err(|e| format!("unable to add a clsact qdisc: {e}"))?;
+        remove_stale_filters(nl, ifindex);
+
+        let name = self.filter_name();
+        let filter = |priority| FilterId {
+            ifindex,
+            direction: Direction::Ingress,
+            priority,
+            handle: self.tun_ifindex,
+        };
+        let mut attached = Vec::new();
+        for (id, fd, csum_flags) in [
+            (
+                filter(CONVERT_PRIORITY),
+                if eth {
+                    programs.ingress_eth
+                } else {
+                    programs.ingress_l3
+                },
+                Some(
+                    netlink::TCA_CSUM_UPDATE_FLAG_IPV4HDR
+                        | netlink::TCA_CSUM_UPDATE_FLAG_TCP
+                        | netlink::TCA_CSUM_UPDATE_FLAG_UDP,
+                ),
+            ),
+            (filter(REDIRECT_PRIORITY), programs.redirect, None),
+        ] {
+            if let Err(e) = nl.add_bpf_filter(id, fd, &name, csum_flags) {
+                for id in attached {
+                    let _ = nl.del_filter(id);
+                }
+                return Err(format!("unable to attach a tc filter: {e}"));
+            }
+            attached.push(id);
+        }
+        filters.insert(ifindex, attached);
+        Ok(())
+    }
+
+    /// Removes the filters from the loopback and network interfaces, after which nothing is
+    /// converted any more. Phantun calls this before it exits, as the filters stay otherwise.
     pub fn detach(&self) {
-        let filters: Vec<_> = self.lo_filters.lock().unwrap().drain(..).collect();
+        let filters: Vec<_> = self
+            .filters
+            .lock()
+            .unwrap()
+            .drain()
+            .flat_map(|(_, f)| f)
+            .collect();
         if filters.is_empty() {
             return;
         }
@@ -348,10 +470,51 @@ impl Offload {
             }
         };
         for id in filters {
-            if let Err(e) = nl.del_filter(id) {
-                warn!("Unable to remove eBPF filter {id:?}: {e}");
+            match nl.del_filter(id) {
+                Ok(()) => {}
+                // The interface is gone, and its filters with it
+                Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {}
+                Err(e) => warn!("Unable to remove eBPF filter {id:?}: {e}"),
             }
         }
+    }
+
+    /// The network interface of the fake TCP connection from `local` to `remote` on the Tun
+    /// interface, with the programs attached, and its addresses there, which NAT may have changed
+    fn nic_path(&self, local: SocketAddr, remote: SocketAddr) -> Result<NicPath, String> {
+        let mut nl = Netlink::new().map_err(|e| format!("netlink: {e}"))?;
+        // Where the kernel sends the packets Phantun writes to the Tun interface
+        let ifindex = nl
+            .forward_interface(local.ip(), remote.ip(), self.tun_ifindex)
+            .map_err(|e| format!("no route to {} from the Tun interface: {e}", remote.ip()))?;
+        if ifindex == self.tun_ifindex || ifindex == LOOPBACK_IFINDEX {
+            return Err(format!("{} is routed to the host itself", remote.ip()));
+        }
+        let (link_type, name) = nl
+            .link(ifindex)
+            .map_err(|e| format!("unable to look up interface {ifindex}: {e}"))?;
+        let eth = match link_type {
+            ARPHRD_ETHER => true,
+            ARPHRD_NONE | ARPHRD_PPP | ARPHRD_RAWIP => false,
+            t => return Err(format!("{name} is of an unsupported type ({t})")),
+        };
+
+        let (wire_local, wire_remote) = Netlink::conntrack()
+            .and_then(|mut ct| ct.conntrack_wire_addresses(local, remote))
+            .map_err(|e| format!("unable to look up the connection in conntrack: {e}"))?
+            // Not tracked, so not NATed either
+            .unwrap_or((local, remote));
+        if wire_local.is_ipv4() != local.is_ipv4() || wire_remote.is_ipv4() != remote.is_ipv4() {
+            return Err("NAT changes its IP version".to_string());
+        }
+
+        self.attach_nic(&mut nl, ifindex, eth)?;
+        Ok(NicPath {
+            ifindex,
+            name,
+            local: wire_local,
+            remote: wire_remote,
+        })
     }
 
     pub fn register(
@@ -379,13 +542,12 @@ impl Offload {
         // fake TCP packets from the remote end, and datagrams from the UDP peer
         let tcp_key = Tuple::new(tcp_remote, tcp_local).ok_or_else(mismatch)?;
         let udp_key = Tuple::new(udp_peer, udp_local).ok_or_else(mismatch)?;
-        let tcp_conversion = Conversion {
-            out: Tuple::new(udp_local, udp_peer).ok_or_else(mismatch)?,
-            ..Default::default()
-        };
-        let udp_conversion = Conversion {
-            out: Tuple::new(tcp_local, tcp_remote).ok_or_else(mismatch)?,
-            ..Default::default()
+        let to_udp = Tuple::new(udp_local, udp_peer).ok_or_else(mismatch)?;
+        let to_tcp = Tuple::new(tcp_local, tcp_remote).ok_or_else(mismatch)?;
+
+        let nic = match self.nic_programs {
+            None => Err("disabled by --no-ebpf-nic".to_string()),
+            Some(_) => self.nic_path(tcp_local, tcp_remote),
         };
 
         let slot = self
@@ -400,25 +562,61 @@ impl Offload {
             std::ptr::write_volatile(state.rx.get(), 0);
         }
 
+        let conversion = |out, ifindex| Conversion {
+            out,
+            slot,
+            ifindex,
+            ..Default::default()
+        };
+        // Fake TCP packets that reach the Tun interface are converted there in any case, e.g.
+        // those arriving on another network interface
+        let mut entries = vec![(Table::Tcp, tcp_key, conversion(to_udp, 0))];
+        let location = match nic {
+            Ok(ref path) => {
+                // Both are of the same IP version as on the Tun interface
+                let wire_key = Tuple::new(path.remote, path.local).unwrap();
+                let wire_out = Tuple::new(path.local, path.remote).unwrap();
+                let nic_conversion = |out, ifindex| Conversion {
+                    tun: tcp_key,
+                    flags: CONV_NIC,
+                    ..conversion(out, ifindex)
+                };
+                // Without NAT, it is the same key
+                entries.retain(|(_, key, _)| *key != wire_key);
+                entries.push((
+                    Table::Tcp,
+                    wire_key,
+                    nic_conversion(to_udp, self.tun_ifindex),
+                ));
+                entries.push((Table::Udp, udp_key, nic_conversion(wire_out, path.ifindex)));
+                entries.push((Table::Tun, to_tcp, nic_conversion(wire_out, path.ifindex)));
+                Location::Nic(path.name.clone())
+            }
+            Err(e) => {
+                entries.push((Table::Udp, udp_key, conversion(to_tcp, self.tun_ifindex)));
+                Location::Tun(e)
+            }
+        };
+
         let conn = Arc::new(Connection {
             offload: self.clone(),
             slot,
-            tcp_key,
-            udp_key,
-            tcp_conversion: Conversion {
-                slot,
-                ..tcp_conversion
-            },
-            udp_conversion: Conversion {
-                slot,
-                ..udp_conversion
-            },
+            entries,
+            location,
             fec_id: Mutex::new(None),
             name: sock.to_string(),
         });
         sock.share_numbers(conn.clone());
 
         Ok(conn)
+    }
+
+    fn table(&self, table: Table) -> &Mutex<BpfHashMap<MapData, Tuple, Conversion>> {
+        match table {
+            Table::Tcp => &self.tcp_conversions,
+            Table::Udp => &self.udp_conversions,
+            Table::Tun => &self.tun_conversions,
+        }
     }
 
     /// Starts the task passing the FEC records of the eBPF programs to the connections
@@ -441,6 +639,30 @@ impl Drop for Offload {
     fn drop(&mut self) {
         self.detach();
     }
+}
+
+/// The network interface of a connection, see [`Offload::nic_path`]
+struct NicPath {
+    ifindex: u32,
+    name: String,
+    local: SocketAddr,
+    remote: SocketAddr,
+}
+
+/// The eBPF maps of conversions
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Table {
+    Tcp,
+    Udp,
+    Tun,
+}
+
+/// Where the fake TCP packets of a connection are converted
+enum Location {
+    /// On the network interface of this name
+    Nic(String),
+    /// On the Tun interface, as the network interface cannot be used for this reason
+    Tun(String),
 }
 
 /// The converted datagrams enter the loopback interface without a route, so the kernel looks one
@@ -470,12 +692,13 @@ fn enable_ipv4_delivery() -> Result<(), String> {
     Ok(())
 }
 
-/// Removes the filters of Phantun instances that are gone, which happens when they are killed
-fn remove_stale_filters(nl: &mut Netlink) {
-    let filters = match nl.bpf_filters(LOOPBACK_IFINDEX, Direction::Ingress) {
+/// Removes the filters that Phantun instances which are gone left on the interface `ifindex`,
+/// which happens when they are killed
+fn remove_stale_filters(nl: &mut Netlink, ifindex: u32) {
+    let filters = match nl.bpf_filters(ifindex, Direction::Ingress) {
         Ok(filters) => filters,
         Err(e) => {
-            warn!("Unable to list the tc filters of the loopback interface: {e}");
+            warn!("Unable to list the tc filters of interface {ifindex}: {e}");
             return;
         }
     };
@@ -483,7 +706,7 @@ fn remove_stale_filters(nl: &mut Netlink) {
         let Some(tun) = f.name.strip_prefix(FILTER_NAME_PREFIX) else {
             continue;
         };
-        if ![LO_CONVERT_PRIORITY, LO_REDIRECT_PRIORITY].contains(&f.id.priority)
+        if ![CONVERT_PRIORITY, REDIRECT_PRIORITY].contains(&f.id.priority)
             || if_index(tun) == Some(f.id.handle)
         {
             continue;
@@ -499,10 +722,9 @@ fn remove_stale_filters(nl: &mut Netlink) {
 pub struct Connection {
     offload: Arc<Offload>,
     slot: u32,
-    tcp_key: Tuple,
-    udp_key: Tuple,
-    tcp_conversion: Conversion,
-    udp_conversion: Conversion,
+    /// What to insert into the maps when it starts
+    entries: Vec<(Table, Tuple, Conversion)>,
+    location: Location,
     /// The ID of its FEC records, if it uses FEC
     fec_id: Mutex<Option<u32>>,
     name: String,
@@ -540,29 +762,37 @@ impl Connection {
         sock: &Arc<Socket>,
         fec: Option<(&Arc<Fec>, Arc<tokio::net::UdpSocket>)>,
     ) -> Result<(), String> {
-        let (mut tcp_conversion, mut udp_conversion) = (self.tcp_conversion, self.udp_conversion);
+        let mut entries = self.entries.clone();
         if let Some((fec, udp_sock)) = fec {
             let id = self.start_fec(sock, fec, udp_sock)?;
-            for c in [&mut tcp_conversion, &mut udp_conversion] {
-                c.fec_id = id;
-                c.fec_data_shards = fec.data_shards() as u32;
+            for (table, _, c) in &mut entries {
+                if *table != Table::Tun {
+                    c.fec_id = id;
+                    c.fec_data_shards = fec.data_shards() as u32;
+                }
             }
         }
 
-        let offload = &self.offload;
-        offload
-            .tcp_conversions
-            .lock()
-            .unwrap()
-            .insert(self.tcp_key, tcp_conversion, 0)
-            .and_then(|_| {
-                offload
-                    .udp_conversions
-                    .lock()
-                    .unwrap()
-                    .insert(self.udp_key, udp_conversion, 0)
-            })
-            .map_err(|e| format!("unable to register the connection: {e}"))
+        for (table, key, conversion) in entries {
+            self.offload
+                .table(table)
+                .lock()
+                .unwrap()
+                .insert(key, conversion, 0)
+                .map_err(|e| format!("unable to register the connection: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Where its packets are converted, for the log
+    pub fn location(&self) -> String {
+        match self.location {
+            Location::Nic(ref name) => format!("on {name}"),
+            Location::Tun(ref reason) => format!(
+                "on the Tun interface {} (not on the network interface: {reason})",
+                self.offload.tun
+            ),
+        }
     }
 
     /// Shares the FEC claims with the eBPF programs and has the records of the connection passed
@@ -635,18 +865,9 @@ impl SharedNumbers for Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self
-            .offload
-            .tcp_conversions
-            .lock()
-            .unwrap()
-            .remove(&self.tcp_key);
-        let _ = self
-            .offload
-            .udp_conversions
-            .lock()
-            .unwrap()
-            .remove(&self.udp_key);
+        for (table, key, _) in &self.entries {
+            let _ = self.offload.table(*table).lock().unwrap().remove(key);
+        }
         if let Some(id) = *self.fec_id.lock().unwrap() {
             self.offload.fec_connections.lock().unwrap().remove(&id);
         }
