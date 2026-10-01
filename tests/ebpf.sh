@@ -309,6 +309,37 @@ fd_limit() {
   fi
 }
 
+# lost_ack: the ACK that ends the handshake is lost, so the server takes the first data packet for
+# it, whose datagram has to arrive all the same
+lost_ack() {
+  echo "=== Handshake ACK lost"
+  local drop=(PREROUTING -p tcp --dport 4567 --tcp-flags ALL ACK -m length --length 40 -j DROP)
+  ip netns exec $NS_S iptables -t raw -I "${drop[@]}"
+  ip netns exec $NS_S env RUST_LOG=info "$BIN_DIR/server" --local 4567 --remote 127.0.0.1:7777 --tun phantun-ts0 \
+    --no-ebpf > "$WORK/server.log" 2>&1 &
+  ip netns exec $NS_C env RUST_LOG=info "$BIN_DIR/client" --local 127.0.0.1:1984 --remote 10.199.0.2:4567 \
+    --tun phantun-tc0 --no-ebpf > "$WORK/client.log" 2>&1 &
+  sleep 1
+
+  local ok
+  ok=$(ip netns exec $NS_C python3 "$WORK/echo.py" client 127.0.0.1 1984 1 1000)
+
+  pkill -f "^$BIN_DIR/(server|client) " || true
+  sleep 0.5
+  ip netns exec $NS_S iptables -t raw -D "${drop[@]}"
+
+  local result=pass
+  if [ "$ok" != 1 ]; then
+    result=fail
+    failed=1
+  fi
+  echo "first datagram echoed: $ok: $result"
+  if [ $result = fail ]; then
+    echo "--- server log"; cat "$WORK/server.log"
+    echo "--- client log"; cat "$WORK/client.log"
+  fi
+}
+
 setup
 run "IPv4" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic
 run "IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic
@@ -321,6 +352,7 @@ run "--no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --no-ebpf
 oneway "One way, --no-ebpf-nic" --no-ebpf-nic
 oneway "One way, --no-ebpf" --no-ebpf
 fd_limit
+lost_ack
 loss 5
 run "FEC with 5% loss" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic --fec 4:2
 run "FEC with 5% loss, IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic --fec 4:2

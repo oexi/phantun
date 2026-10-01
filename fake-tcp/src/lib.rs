@@ -341,9 +341,22 @@ impl Socket {
                             // longer NAT what follows, until they see another packet from here
                             // with the scaled window. Send one now, as otherwise the next one may
                             // only be the ACK after MAX_UNACKED_LEN if traffic only goes one way.
-                            let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
-                            if let Err(e) = self.tun.send(&buf).await {
+                            let ack = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                            if let Err(e) = self.tun.send(&ack).await {
                                 warn!("Unable to send ACK to {}: {}", self.remote_addr, e);
+                            }
+
+                            // When a data packet replaced the ACK, its datagram is still passed
+                            // on, after the packets queued behind it
+                            if !tcp_packet.payload().is_empty() {
+                                let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
+                                let incoming =
+                                    self.shared.tuples.read().unwrap().get(&tuple).cloned();
+                                if let Some(incoming) = incoming
+                                    && incoming.try_send(buf.clone()).is_err()
+                                {
+                                    trace!("Queue of {} full, dropping first packet", self);
+                                }
                             }
 
                             info!("Connection from {:?} established", self.remote_addr);
