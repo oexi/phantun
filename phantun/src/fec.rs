@@ -362,16 +362,58 @@ fn data_shard(datagram: &[u8]) -> Vec<u8> {
     shard
 }
 
+/// Shared memory holding the group number (upper half) and the number of data shards taken in it
+/// (lower half) of the encoder of a connection, which something else sending data shards on its
+/// behalf, such as an eBPF program, takes from as well. Whoever takes the last index of a group
+/// moves on to the next one. See [`Fec::share_claims`].
+#[cfg(target_has_atomic = "64")]
+pub trait SharedClaims: Send + Sync {
+    fn claims(&self) -> &std::sync::atomic::AtomicU64;
+}
+
+/// Where the group numbers and indexes of data shards come from
+enum Claims {
+    Local {
+        group: u32,
+        count: usize,
+    },
+    #[cfg(target_has_atomic = "64")]
+    Shared(Arc<dyn SharedClaims>),
+}
+
+/// A group whose data shards are being collected. Shards sent by someone else may arrive out of
+/// order or after the group was closed.
+struct Pending {
+    group: u32,
+    /// Data shards by index, not padded yet
+    shards: Vec<Option<Vec<u8>>>,
+    present: usize,
+    /// The number of data shards, if the group was closed before it was full
+    closed_at: Option<usize>,
+    started: Instant,
+}
+
+impl Pending {
+    fn data_shards(&self) -> usize {
+        self.closed_at.unwrap_or(self.shards.len())
+    }
+}
+
+/// How long a group other than the current one may wait for data shards taken by someone else,
+/// which only happens if they never get to send them
+const MAX_PENDING_TIME: Duration = Duration::from_secs(1);
+
 struct Encoder {
     config: FecConfig,
     /// Number of parity shards by number of data shards in the group, minus one
     parity: Vec<usize>,
     /// Codecs by number of data shards in the group, minus one, created as needed
     codecs: Vec<Option<Arc<ReedSolomon>>>,
-    group: u32,
-    /// Data shards of the current group, not padded yet
-    shards: Vec<Vec<u8>>,
-    started: Option<Instant>,
+    claims: Claims,
+    /// Groups with data shards that are yet to be encoded, oldest first
+    pending: Vec<Pending>,
+    /// Whether a group has been started since the flusher was last told
+    started_group: bool,
     /// Only the sent counters are used
     stats: Stats,
 }
@@ -384,64 +426,221 @@ impl Encoder {
             codecs: vec![None; config.data_shards],
             // a random start makes it unlikely that anything else the peer receives, such as a
             // handshake packet, passes for a shard of a recent group
-            group: rand::random(),
-            shards: Vec::with_capacity(config.data_shards),
-            started: None,
+            claims: Claims::Local {
+                group: rand::random(),
+                count: 0,
+            },
+            pending: Vec::new(),
+            started_group: false,
             stats: Stats::default(),
         }
     }
 
-    /// Turns `buf` (`HEADROOM` bytes followed by the datagram) into a data shard in place.
-    /// Returns the group if this closes it.
-    fn push(&mut self, buf: &mut [u8], now: Instant) -> Option<ClosedGroup> {
-        buf[0] = TYPE_DATA;
-        buf[1..5].copy_from_slice(&self.group.to_be_bytes());
-        buf[5] = self.shards.len() as u8;
-        self.shards.push(data_shard(&buf[HEADROOM..]));
+    /// Takes the group number and index for the next data shard
+    fn claim(&mut self) -> (u32, u8) {
+        let k = self.config.data_shards;
+        match &mut self.claims {
+            Claims::Local { group, count } => {
+                let claimed = (*group, *count as u8);
+                *count += 1;
+                if *count == k {
+                    *group = group.wrapping_add(1);
+                    *count = 0;
+                }
+                claimed
+            }
+            #[cfg(target_has_atomic = "64")]
+            Claims::Shared(shared) => {
+                use std::sync::atomic::Ordering;
+                let claims = shared.claims();
+                let mut old = claims.load(Ordering::Acquire);
+                loop {
+                    let (group, count) = ((old >> 32) as u32, old as u32 as usize);
+                    let new = if count + 1 >= k {
+                        (group.wrapping_add(1) as u64) << 32
+                    } else {
+                        old + 1
+                    };
+                    match claims.compare_exchange_weak(
+                        old,
+                        new,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return (group, count as u8),
+                        Err(current) => old = current,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes claims from `shared` from now on, continuing with the current group
+    #[cfg(target_has_atomic = "64")]
+    fn share(&mut self, shared: Arc<dyn SharedClaims>) {
+        let (group, count) = self.current();
+        shared.claims().store(
+            ((group as u64) << 32) | count as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.claims = Claims::Shared(shared);
+    }
+
+    /// The group data shards are taken from, and how many have been taken from it
+    fn current(&self) -> (u32, usize) {
+        match &self.claims {
+            Claims::Local { group, count } => (*group, *count),
+            #[cfg(target_has_atomic = "64")]
+            Claims::Shared(shared) => {
+                let claims = shared.claims().load(std::sync::atomic::Ordering::Acquire);
+                ((claims >> 32) as u32, claims as u32 as usize)
+            }
+        }
+    }
+
+    /// Adds data shard `index` of `group`. Returns the group if it is now complete.
+    fn insert(
+        &mut self,
+        group: u32,
+        index: u8,
+        shard: Vec<u8>,
+        now: Instant,
+    ) -> Option<ClosedGroup> {
+        let k = self.config.data_shards;
+        if index as usize >= k {
+            return None;
+        }
+
+        let pos = match self.pending.iter().position(|p| p.group == group) {
+            Some(pos) => pos,
+            None => {
+                self.pending.push(Pending {
+                    group,
+                    shards: vec![None; k],
+                    present: 0,
+                    closed_at: None,
+                    started: now,
+                });
+                self.started_group = true;
+                self.pending.len() - 1
+            }
+        };
+        let pending = &mut self.pending[pos];
+        if pending.shards[index as usize].is_some() {
+            return None;
+        }
+        pending.shards[index as usize] = Some(shard);
+        pending.present += 1;
         self.stats.sent_data += 1;
 
-        if self.started.is_none() {
-            self.started = Some(now);
+        self.complete(pos)
+    }
+
+    /// Removes and returns the group at `pos` of `pending` if it has all of its data shards
+    fn complete(&mut self, pos: usize) -> Option<ClosedGroup> {
+        let pending = &self.pending[pos];
+        let k = pending.data_shards();
+        if pending.present < k || pending.shards[..k].iter().any(Option::is_none) {
+            return None;
         }
 
-        (self.shards.len() == self.config.data_shards).then(|| self.finish())
-    }
-
-    /// When the current group has to be flushed, or `None` if it is empty
-    fn deadline(&self) -> Option<Instant> {
-        self.started.map(|t| t + self.config.timeout)
-    }
-
-    fn flush_expired(&mut self, now: Instant) -> Option<ClosedGroup> {
-        match self.deadline() {
-            Some(deadline) if deadline <= now => Some(self.finish()),
-            _ => None,
-        }
-    }
-
-    /// Closes the current group
-    fn finish(&mut self) -> ClosedGroup {
-        let k = self.shards.len();
+        let pending = self.pending.remove(pos);
         let m = self.parity[k - 1];
         let codec = self.codecs[k - 1]
             .get_or_insert_with(|| {
                 codec(k, m).expect("FEC parameters are validated by parse_ratio")
             })
             .clone();
-
-        let group = ClosedGroup {
-            group: self.group,
-            shards: std::mem::replace(
-                &mut self.shards,
-                Vec::with_capacity(self.config.data_shards),
-            ),
-            codec,
-        };
-        self.group = self.group.wrapping_add(1);
-        self.started = None;
         self.stats.sent_parity += m as u64;
 
-        group
+        Some(ClosedGroup {
+            group: pending.group,
+            shards: pending
+                .shards
+                .into_iter()
+                .take(k)
+                .map(Option::unwrap)
+                .collect(),
+            codec,
+        })
+    }
+
+    #[cfg(test)]
+    fn group(&self) -> u32 {
+        self.current().0
+    }
+
+    #[cfg(test)]
+    fn set_group(&mut self, group: u32) {
+        self.claims = Claims::Local { group, count: 0 };
+    }
+
+    /// Turns `buf` (`HEADROOM` bytes followed by the datagram) into a data shard in place.
+    /// Returns the group if this closes it.
+    fn push(&mut self, buf: &mut [u8], now: Instant) -> Option<ClosedGroup> {
+        let (group, index) = self.claim();
+        buf[0] = TYPE_DATA;
+        buf[1..5].copy_from_slice(&group.to_be_bytes());
+        buf[5] = index;
+        self.insert(group, index, data_shard(&buf[HEADROOM..]), now)
+    }
+
+    /// When the current group has to be flushed, or `None` if it is empty. Data shards that
+    /// someone else takes are only known once they arrive.
+    fn deadline(&self) -> Option<Instant> {
+        let (group, count) = self.current();
+        if count == 0 {
+            return None;
+        }
+        self.pending
+            .iter()
+            .find(|p| p.group == group)
+            .map(|p| p.started + self.config.timeout)
+    }
+
+    /// Closes the current group if it has not been filled within the timeout. Returns it, unless
+    /// it is still missing data shards someone else has taken.
+    fn flush_expired(&mut self, now: Instant) -> Option<ClosedGroup> {
+        let (group, count) = self.current();
+        // forget closed groups whose data shards never arrived
+        self.pending
+            .retain(|p| p.group == group || p.started + MAX_PENDING_TIME > now);
+
+        let deadline = self.deadline()?;
+        if deadline > now {
+            return None;
+        }
+        let closed_at = match &mut self.claims {
+            Claims::Local {
+                group: local_group,
+                count: local_count,
+            } => {
+                *local_group = local_group.wrapping_add(1);
+                *local_count = 0;
+                count
+            }
+            #[cfg(target_has_atomic = "64")]
+            Claims::Shared(shared) => {
+                use std::sync::atomic::Ordering;
+                let old = ((group as u64) << 32) | count as u64;
+                let new = (group.wrapping_add(1) as u64) << 32;
+                match shared.claims().compare_exchange(
+                    old,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => count,
+                    // filled up or grew in the meantime, try again on the next wake up, which
+                    // is right away as the deadline has passed
+                    Err(_) => return None,
+                }
+            }
+        };
+
+        let pos = self.pending.iter().position(|p| p.group == group)?;
+        self.pending[pos].closed_at = Some(closed_at);
+        self.complete(pos)
     }
 }
 
@@ -656,19 +855,8 @@ impl Decoder {
         match frame[0] {
             TYPE_DATA => {
                 let payload = &frame[HEADROOM..];
-                let Some(slot) = self.data_slot(id, index, payload) else {
-                    // FEC can not help with this one, but it is still worth forwarding
-                    self.stats.received_data += 1;
-                    return (Some(payload), None);
-                };
-                let group = self.slots[slot].as_mut().unwrap();
-                if group.done || group.data.iter().any(|(i, _)| *i == index) {
-                    return (None, None);
-                }
-
-                group.data.push((index, data_shard(payload)));
-                self.stats.received_data += 1;
-                (Some(payload), self.recovery(slot))
+                let (new, recovery) = self.data(id, index, payload);
+                (new.then_some(payload), recovery)
             }
             TYPE_PARITY => {
                 if frame.len() < PARITY_HEADER_LEN + LEN_PREFIX {
@@ -711,6 +899,24 @@ impl Decoder {
                 (None, None)
             }
         }
+    }
+
+    /// Takes data shard `index` of group `id`. Returns whether it is new, and the group if lost
+    /// data shards can now be recovered.
+    fn data(&mut self, id: u32, index: u8, payload: &[u8]) -> (bool, Option<Recovery>) {
+        let Some(slot) = self.data_slot(id, index, payload) else {
+            // FEC can not help with this one, but it is still worth forwarding
+            self.stats.received_data += 1;
+            return (true, None);
+        };
+        let group = self.slots[slot].as_mut().unwrap();
+        if group.done || group.data.iter().any(|(i, _)| *i == index) {
+            return (false, None);
+        }
+
+        group.data.push((index, data_shard(payload)));
+        self.stats.received_data += 1;
+        (true, self.recovery(slot))
     }
 
     /// Closes the group in `slot` once it has either all of its data shards, or enough shards to
@@ -869,6 +1075,56 @@ impl Fec {
         }
     }
 
+    /// `K`, the number of data shards in a full group
+    pub fn data_shards(&self) -> usize {
+        self.encoder.lock().unwrap().config.data_shards
+    }
+
+    /// Takes group numbers and data shard indexes from `shared` from now on, which someone else
+    /// sending data shards takes from as well. The data shards they send have to be passed to
+    /// [`Fec::sent_elsewhere`].
+    #[cfg(target_has_atomic = "64")]
+    pub fn share_claims(&self, shared: Arc<dyn SharedClaims>) {
+        self.encoder.lock().unwrap().share(shared);
+    }
+
+    /// Takes the data shard `index` of `group` that has been sent elsewhere, with the shared
+    /// claims. Returns the parity shards to send right away.
+    pub fn sent_elsewhere(&self, group: u32, index: u8, datagram: &[u8]) -> Vec<Vec<u8>> {
+        let now = Instant::now();
+        let closed = {
+            let mut encoder = self.encoder.lock().unwrap();
+            let closed = encoder.insert(group, index, data_shard(datagram), now);
+            if std::mem::take(&mut encoder.started_group) {
+                self.wake.notify_one();
+            }
+            closed
+        };
+        closed.map_or_else(Vec::new, |closed| self.schedule(closed.encode(), now))
+    }
+
+    /// Takes the data shard `index` of `group` that has been received and forwarded elsewhere.
+    /// Returns the datagrams of the data shards this recovers.
+    pub fn received_elsewhere(&self, group: u32, index: u8, datagram: &[u8]) -> Vec<Vec<u8>> {
+        let (_, recovery) = self.decoder.lock().unwrap().data(group, index, datagram);
+        let mut recovered = Vec::new();
+        if let Some(recovery) = recovery {
+            recovery.run(&mut recovered);
+        }
+        recovered
+    }
+
+    /// Takes a parity frame received elsewhere. Returns the datagrams of the data shards this
+    /// recovers.
+    pub fn parity_received_elsewhere(&self, frame: &[u8]) -> Vec<Vec<u8>> {
+        let (_, recovery) = self.decoder.lock().unwrap().feed(frame);
+        let mut recovered = Vec::new();
+        if let Some(recovery) = recovery {
+            recovery.run(&mut recovered);
+        }
+        recovered
+    }
+
     /// Takes the parity shards of a group that closed at `now` and returns those to send right
     /// away. When they are spread out, the others are queued for the flusher to send later.
     fn schedule(&self, parity: Vec<Vec<u8>>, now: Instant) -> Vec<Vec<u8>> {
@@ -915,9 +1171,8 @@ pub async fn send_datagram(sock: &Socket, fec: Option<&Fec>, buf: &mut [u8]) -> 
     let now = Instant::now();
     let closed = {
         let mut encoder = fec.encoder.lock().unwrap();
-        let group_started = encoder.started.is_none();
         let closed = encoder.push(buf, now);
-        if group_started && encoder.started.is_some() {
+        if std::mem::take(&mut encoder.started_group) {
             fec.wake.notify_one();
         }
         closed
@@ -1411,7 +1666,7 @@ mod tests {
     fn stray_frame_before_first_group() {
         let mut encoder = Encoder::new(config(10, 3));
         // what a zeroed handshake packet looks like, and the group it would have collided with
-        encoder.group = 12345;
+        encoder.set_group(12345);
         let (frames, datagrams) = groups(&mut encoder, 2, 10);
 
         // one data shard of the second group is lost
@@ -1438,7 +1693,7 @@ mod tests {
         datagrams.extend(more);
 
         let mut stray = vec![0u8; HEADROOM + 10];
-        stray[1..5].copy_from_slice(&encoder.group.wrapping_add(1 << 31).to_be_bytes());
+        stray[1..5].copy_from_slice(&encoder.group().wrapping_add(1 << 31).to_be_bytes());
         let frames: Vec<_> = first
             .iter()
             .chain([&stray])
@@ -1469,7 +1724,7 @@ mod tests {
         assert_eq!(decode(&mut decoder, frames.iter()), datagrams);
 
         // everything is lost for a while
-        encoder.group = encoder.group.wrapping_add(MAX_GROUPS as u32 * 2);
+        encoder.set_group(encoder.group().wrapping_add(MAX_GROUPS as u32 * 2));
 
         // the first data shard after the outage is forwarded, and the second one resyncs the decoder
         let (frames, datagrams) = groups(&mut encoder, 2, 10);
@@ -1482,15 +1737,15 @@ mod tests {
                 .map(|(_, f)| f),
         );
         assert_eq!(sorted(delivered), sorted(datagrams));
-        assert_eq!(decoder.newest, Some(encoder.group.wrapping_sub(1)));
+        assert_eq!(decoder.newest, Some(encoder.group().wrapping_sub(1)));
     }
 
     #[test]
     fn group_number_wrap_around() {
         let mut encoder = Encoder::new(config(10, 3));
-        encoder.group = u32::MAX - 1;
+        encoder.set_group(u32::MAX - 1);
         let (frames, datagrams) = groups(&mut encoder, 4, 10);
-        assert_eq!(encoder.group, 2);
+        assert_eq!(encoder.group(), 2);
 
         // one data shard lost in every group
         let delivered = decode(
@@ -1519,7 +1774,7 @@ mod tests {
         decode(&mut decoder, frames.map(|(_, f)| f));
 
         // the peer moves on, which forgets all of them
-        encoder.group = encoder.group.wrapping_add(MAX_GROUPS as u32 * 2);
+        encoder.set_group(encoder.group().wrapping_add(MAX_GROUPS as u32 * 2));
         let (new, _) = groups(&mut encoder, 1, 10);
         decode(&mut decoder, new[..2].iter());
 
@@ -1591,5 +1846,126 @@ mod tests {
             feed(&mut decoder, f, &mut Vec::new());
             assert!(!decoder.mismatch());
         }
+    }
+
+    /// Claims shared with something else taking data shards, here the test standing in for the
+    /// eBPF program
+    #[cfg(target_has_atomic = "64")]
+    struct TestClaims(std::sync::atomic::AtomicU64);
+
+    #[cfg(target_has_atomic = "64")]
+    impl SharedClaims for TestClaims {
+        fn claims(&self) -> &std::sync::atomic::AtomicU64 {
+            &self.0
+        }
+    }
+
+    /// Claims like udp_to_tcp in offload.bpf.c does
+    #[cfg(target_has_atomic = "64")]
+    fn kernel_claim(claims: &TestClaims, k: usize) -> (u32, u8) {
+        use std::sync::atomic::Ordering;
+        let old = claims.0.load(Ordering::Acquire);
+        let (group, count) = ((old >> 32) as u32, old as u32 as usize);
+        let new = if count + 1 >= k {
+            (group.wrapping_add(1) as u64) << 32
+        } else {
+            old + 1
+        };
+        claims
+            .0
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap();
+        (group, count as u8)
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn shared_claims() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let (k, m) = (10, 4);
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut encoder = Encoder::new(config(k, m));
+        let start = Instant::now();
+        let mut now = start;
+
+        // the group in progress carries over, as when a connection is registered after its
+        // first datagram was sent
+        let mut sent = vec![datagram(10_000)];
+        let mut buf = vec![0u8; HEADROOM];
+        buf.extend_from_slice(&sent[0]);
+        assert!(encoder.push(&mut buf, now).is_none());
+        let mut frames = vec![buf];
+        let shared = Arc::new(TestClaims(std::sync::atomic::AtomicU64::new(0)));
+        encoder.share(shared.clone());
+
+        // datagrams sent by the kernel, whose records arrive later and out of order
+        let mut records = Vec::new();
+        for i in 0..2000 {
+            let d = datagram(i);
+            sent.push(d.clone());
+            if rng.random_bool(0.7) {
+                let (group, index) = kernel_claim(&shared, k);
+                let mut frame = vec![TYPE_DATA];
+                frame.extend_from_slice(&group.to_be_bytes());
+                frame.push(index);
+                frame.extend_from_slice(&d);
+                frames.push(frame);
+                records.push((group, index, d));
+            } else {
+                let mut buf = vec![0u8; HEADROOM];
+                buf.extend_from_slice(&d);
+                let closed = encoder.push(&mut buf, now);
+                frames.push(buf);
+                frames.extend(closed.into_iter().flat_map(ClosedGroup::encode));
+            }
+
+            // deliver some of the records, in random order
+            while !records.is_empty() && rng.random_bool(0.6) {
+                let (group, index, d) = records.swap_remove(rng.random_range(0..records.len()));
+                let closed = encoder.insert(group, index, data_shard(&d), now);
+                frames.extend(closed.into_iter().flat_map(ClosedGroup::encode));
+            }
+
+            // time passes, sometimes long enough to close a group early
+            now += Duration::from_millis(if rng.random_bool(0.05) { 20 } else { 1 });
+            let closed = encoder.flush_expired(now);
+            frames.extend(closed.into_iter().flat_map(ClosedGroup::encode));
+        }
+        for (group, index, d) in records.drain(..) {
+            let closed = encoder.insert(group, index, data_shard(&d), now);
+            frames.extend(closed.into_iter().flat_map(ClosedGroup::encode));
+        }
+        now += Duration::from_millis(20);
+        frames.extend(
+            encoder
+                .flush_expired(now)
+                .into_iter()
+                .flat_map(ClosedGroup::encode),
+        );
+        assert!(encoder.pending.is_empty());
+
+        // every group can lose up to M of its shards
+        let mut lost_per_group: HashMap<u32, usize> = HashMap::new();
+        let received: Vec<_> = frames
+            .into_iter()
+            .filter(|f| {
+                let group = u32::from_be_bytes(f[1..5].try_into().unwrap());
+                let lost = lost_per_group.entry(group).or_default();
+                // the lost data shards of a group have to be recoverable with its parity shards,
+                // which is only checked by delivering everything below
+                if *lost < 2 && rng.random_bool(0.1) {
+                    *lost += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        let mut decoder = Decoder::default();
+        assert_eq!(sorted(decode(&mut decoder, received.iter())), sorted(sent));
+        assert_eq!(decoder.stats.lost, 0);
     }
 }

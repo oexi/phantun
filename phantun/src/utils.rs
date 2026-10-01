@@ -30,6 +30,7 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
     )
     .unwrap();
     udp_sock.set_reuse_port(true).unwrap();
+    raise_recv_buffer(&udp_sock);
     // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
     udp_sock.set_cloexec(true).unwrap();
     udp_sock.set_nonblocking(true).unwrap();
@@ -51,6 +52,30 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
     udp_sock.bind(&socket2::SockAddr::from(local_addr)).unwrap();
     let udp_sock: std::net::UdpSocket = udp_sock.into();
     udp_sock.try_into().unwrap()
+}
+
+/// The receive buffer size of the UDP sockets. Applications such as kernel WireGuard send
+/// datagrams in bursts, which overflow the default buffer of about 200 KiB before Phantun gets to
+/// read them. The losses this causes make TCP inside the tunnel retransmit a lot and slow down.
+/// A larger buffer only queues more while Phantun cannot keep up, which adds up to about 15 ms of
+/// latency at 500 Mbit/s.
+const UDP_RECV_BUFFER: usize = 1024 * 1024;
+
+/// Raises the receive buffer of `sock` to `UDP_RECV_BUFFER`, beyond net.core.rmem_max if
+/// permitted, which CAP_NET_ADMIN does
+fn raise_recv_buffer(sock: &socket2::Socket) {
+    use nix::sys::socket::{setsockopt, sockopt};
+
+    // the kernel doubles the requested size to account for its overhead
+    if sock
+        .recv_buffer_size()
+        .is_ok_and(|size| size >= 2 * UDP_RECV_BUFFER)
+    {
+        return;
+    }
+    if setsockopt(sock, sockopt::RcvBufForce, &UDP_RECV_BUFFER).is_err() {
+        let _ = setsockopt(sock, sockopt::RcvBuf, &UDP_RECV_BUFFER);
+    }
 }
 
 /// Similiar to `UdpSocket::recv_from()`, but returns a 3rd value `IPAddr`
@@ -152,4 +177,14 @@ pub fn assign_ipv6_address(device_name: &str, local: Ipv6Addr, peer: Ipv6Addr) {
 
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
+}
+
+/// Completes when the process receives SIGINT or SIGTERM
+pub async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("unable to listen for SIGTERM");
+    tokio::select! {
+        _ = term.recv() => {},
+        _ = tokio::signal::ctrl_c() => {},
+    }
 }

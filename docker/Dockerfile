@@ -11,12 +11,17 @@
 # binaries never link against a newer glibc than the runtime provides.
 FROM rust:1-trixie AS builder
 
+# clang builds the eBPF program
+RUN apt-get update && apt-get install -y --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /usr/src/phantun
 COPY . .
 
 ENV CARGO_PROFILE_RELEASE_STRIP=true
 ENV CARGO_PROFILE_RELEASE_LTO=true
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ENV PHANTUN_REQUIRE_EBPF=1
 
 # target/ lives in a cache mount, so copy the binaries out in the same step
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

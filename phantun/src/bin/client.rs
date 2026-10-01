@@ -3,7 +3,8 @@ use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
 use phantun::fec::{self, Fec, FecConfig, HEADROOM};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
+use phantun::offload;
+use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -103,6 +104,7 @@ async fn main() -> io::Result<()> {
                       The content is always sent out in a single packet and will not be further segmented")
         )
         .args(fec::args())
+        .args(offload::args())
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -173,6 +175,8 @@ async fn main() -> io::Result<()> {
 
     info!("Created TUN device {}", tun[0].name());
 
+    let offload = offload::start(&matches, tun[0].name(), fec_config.is_some());
+
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<
         SocketAddr,
@@ -181,7 +185,9 @@ async fn main() -> io::Result<()> {
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
 
+    let main_offload = offload.clone();
     let main_loop = tokio::spawn(async move {
+        let offload = main_offload;
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
@@ -203,7 +209,7 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            let sock = Arc::new(sock.unwrap());
+            let mut sock = sock.unwrap();
             if let Some(ref p) = handshake_packet {
                 if sock.send(p).await.is_none() {
                     error!("Failed to send handshake packet to remote, closing connection.");
@@ -222,6 +228,50 @@ async fn main() -> io::Result<()> {
             {
                 continue;
             }
+
+            // Always reply from the same address that the peer used to communicate with
+            // us. This avoids a frequent problem with IPv6 privacy extensions when we
+            // erroneously bind to wrong short-lived temporary address even if the peer
+            // explicitly used a persistent address to communicate to us.
+            //
+            // To do so, first bind to (<incoming packet dst_ip>, <local addr port>), and then
+            // connect to (<incoming packet src_ip>, <incoming packet src_port>).
+            let bind_addr = match (udp_remote_addr, udp_local_addr) {
+                (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
+                    SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
+                }
+                (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
+                    SocketAddr::V6(SocketAddrV6::new(
+                        udp_local_ipv6,
+                        local_addr.port(),
+                        udp_remote_addr.flowinfo(),
+                        udp_remote_addr.scope_id(),
+                    ))
+                }
+                (_, _) => {
+                    panic!(
+                        "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                    );
+                }
+            };
+
+            let mut udp_socks = Vec::with_capacity(num_cpus);
+            for _ in 0..num_cpus {
+                let udp_sock = new_udp_reuseport(bind_addr);
+                if let Err(e) = udp_sock.connect(udp_remote_addr).await {
+                    error!("Unable to connect UDP socket to {}: {}", udp_remote_addr, e);
+                    break;
+                }
+                udp_socks.push(Arc::new(udp_sock));
+            }
+            if udp_socks.len() < num_cpus {
+                continue;
+            }
+
+            let offloaded =
+                offload::register(offload.as_ref(), &mut sock, bind_addr, udp_remote_addr);
+            let sock = Arc::new(sock);
+            offload::start_connection(offloaded.as_ref(), &sock, fec.as_ref(), &udp_socks[0]);
 
             assert!(
                 connections
@@ -251,7 +301,7 @@ async fn main() -> io::Result<()> {
                 });
             }
 
-            for i in 0..num_cpus {
+            for (i, udp_sock) in udp_socks.into_iter().enumerate() {
                 let sock = sock.clone();
                 let fec = fec.clone();
                 let quit = quit.clone();
@@ -261,33 +311,6 @@ async fn main() -> io::Result<()> {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
                     let mut buf_tcp = [0u8; MAX_PACKET_LEN];
                     let mut recovered = Vec::new();
-                    // Always reply from the same address that the peer used to communicate with
-                    // us. This avoids a frequent problem with IPv6 privacy extensions when we
-                    // erroneously bind to wrong short-lived temporary address even if the peer
-                    // explicitly used a persistent address to communicate to us.
-                    //
-                    // To do so, first bind to (<incoming packet dst_ip>, <local addr port>), and then
-                    // connect to (<incoming packet src_ip>, <incoming packet src_port>).
-                    let bind_addr = match (udp_remote_addr, udp_local_addr) {
-                        (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
-                        }
-                        (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
-                            SocketAddr::V6(SocketAddrV6::new(
-                                udp_local_ipv6,
-                                local_addr.port(),
-                                udp_remote_addr.flowinfo(),
-                                udp_remote_addr.scope_id(),
-                            ))
-                        }
-                        (_, _) => {
-                            panic!(
-                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
-                            );
-                        }
-                    };
-                    let udp_sock = new_udp_reuseport(bind_addr);
-                    udp_sock.connect(udp_remote_addr).await.unwrap();
 
                     loop {
                         tokio::select! {
@@ -330,12 +353,21 @@ async fn main() -> io::Result<()> {
 
             let connections = connections.clone();
             tokio::spawn(async move {
+                // Packets converted by eBPF do not pass through here
+                let mut offloaded_packets = offloaded.as_ref().map_or(0, |c| c.packets());
                 loop {
                     let read_timeout = time::sleep(UDP_TTL);
                     let packet_received_fut = packet_received.notified();
 
                     tokio::select! {
                         _ = read_timeout => {
+                            if let Some(ref c) = offloaded {
+                                let packets = c.packets();
+                                if packets != offloaded_packets {
+                                    offloaded_packets = packets;
+                                    continue;
+                                }
+                            }
                             info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
                             connections.write().await.remove(&udp_remote_addr);
                             debug!("removed fake TCP socket from connections table");
@@ -355,5 +387,15 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    tokio::join!(main_loop).0.unwrap()
+    let result = tokio::select! {
+        result = main_loop => result.unwrap(),
+        _ = shutdown_signal() => {
+            info!("Exiting");
+            Ok(())
+        },
+    };
+    if let Some(offload) = offload {
+        offload.detach();
+    }
+    result
 }

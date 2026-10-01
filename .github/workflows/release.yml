@@ -36,8 +36,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
+      - name: Build the eBPF program
+        # The clang of the images of cross is too old, so build it here with the arguments of
+        # CLANG_ARGS in phantun/build.rs, which picks it up with PHANTUN_BPF_OBJECT_DIR
+        run: |
+          mkdir -p target/bpf
+          for t in bpfel bpfeb; do
+            clang -O2 -g -Wall -Werror -mcpu=v3 -target $t -c phantun/src/bpf/offload.bpf.c -o target/bpf/offload.$t.o
+          done
       - name: Build
         run: cross build --release --target ${{ matrix.target }}
+        env:
+          PHANTUN_BPF_OBJECT_DIR: target/bpf
+          PHANTUN_REQUIRE_EBPF: 1
       - name: Rename artifacts and compress
         run: |
           cd target/${{ matrix.target }}/release
@@ -72,8 +83,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
+      - name: Build the eBPF program
+        # The clang of the images of cross is too old, so build it here with the arguments of
+        # CLANG_ARGS in phantun/build.rs, which picks it up with PHANTUN_BPF_OBJECT_DIR
+        run: |
+          mkdir -p target/bpf
+          for t in bpfel bpfeb; do
+            clang -O2 -g -Wall -Werror -mcpu=v3 -target $t -c phantun/src/bpf/offload.bpf.c -o target/bpf/offload.$t.o
+          done
       - name: Build
         run: cross build --release --target ${{ matrix.target }} -Z build-std
+        env:
+          PHANTUN_BPF_OBJECT_DIR: target/bpf
+          PHANTUN_REQUIRE_EBPF: 1
       - name: Rename artifacts and compress
         run: |
           cd target/${{ matrix.target }}/release
