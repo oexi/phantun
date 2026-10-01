@@ -336,6 +336,16 @@ impl Socket {
                             self.numbers().flags.fetch_or(FLAG_PSH, Ordering::Relaxed);
                             self.state = State::Established;
 
+                            // The window of the SYN + ACK cannot be scaled, so stateful firewalls
+                            // such as conntrack only let 64 KB through from the client, and no
+                            // longer NAT what follows, until they see another packet from here
+                            // with the scaled window. Send one now, as otherwise the next one may
+                            // only be the ACK after MAX_UNACKED_LEN if traffic only goes one way.
+                            let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                            if let Err(e) = self.tun.send(&buf).await {
+                                warn!("Unable to send ACK to {}: {}", self.remote_addr, e);
+                            }
+
                             info!("Connection from {:?} established", self.remote_addr);
                             let ready = self.shared.ready.clone();
                             if let Err(e) = ready.send(self).await {
