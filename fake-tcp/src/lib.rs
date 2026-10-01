@@ -63,6 +63,7 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MPSC_BUFFER_LEN: usize = 128;
+// Also in phantun/src/bpf/offload.bpf.c
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -102,15 +103,51 @@ pub enum State {
     Established,
 }
 
+/// The sequence and acknowledgement numbers of a connection
+#[repr(C)]
+#[derive(Default)]
+pub struct Numbers {
+    pub seq: AtomicU32,
+    pub ack: AtomicU32,
+    /// The acknowledgement number most recently sent
+    pub last_ack: AtomicU32,
+    /// `FLAG_*`
+    pub flags: AtomicU32,
+}
+
+/// Set in [`Numbers::flags`] once the other end is known to have completed the handshake, after
+/// which data packets carry PSH. PSH stops the receiving kernel from merging the packets with GRO,
+/// which would keep them from the eBPF data path of Phantun. Until then, data packets only carry
+/// ACK, as older versions also take the first one as the end of the handshake if its ACK was lost.
+pub const FLAG_PSH: u32 = 1;
+
+/// Memory holding the [`Numbers`] of a connection that is shared with something else sending and
+/// receiving on its behalf, such as an eBPF program. See [`Socket::share_numbers`].
+pub trait SharedNumbers: Send + Sync {
+    fn numbers(&self) -> &Numbers;
+}
+
+enum NumbersStorage {
+    Owned(Numbers),
+    Shared(Arc<dyn SharedNumbers>),
+}
+
+impl NumbersStorage {
+    fn get(&self) -> &Numbers {
+        match self {
+            NumbersStorage::Owned(n) => n,
+            NumbersStorage::Shared(s) => s.numbers(),
+        }
+    }
+}
+
 pub struct Socket {
     shared: Arc<Shared>,
     tun: Arc<Tun>,
     incoming: flume::Receiver<Bytes>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
-    seq: AtomicU32,
-    ack: AtomicU32,
-    last_ack: AtomicU32,
+    numbers: NumbersStorage,
     state: State,
 }
 
@@ -139,27 +176,58 @@ impl Socket {
                 incoming: incoming_rx,
                 local_addr,
                 remote_addr,
-                seq: AtomicU32::new(0),
-                ack: AtomicU32::new(ack.unwrap_or(0)),
-                last_ack: AtomicU32::new(ack.unwrap_or(0)),
+                numbers: NumbersStorage::Owned(Numbers {
+                    seq: AtomicU32::new(0),
+                    ack: AtomicU32::new(ack.unwrap_or(0)),
+                    last_ack: AtomicU32::new(ack.unwrap_or(0)),
+                    flags: AtomicU32::new(0),
+                }),
                 state,
             },
             incoming_tx,
         )
     }
 
-    fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
-        let ack = self.ack.load(Ordering::Relaxed);
-        self.last_ack.store(ack, Ordering::Relaxed);
+    fn numbers(&self) -> &Numbers {
+        self.numbers.get()
+    }
 
-        build_tcp_packet(
-            self.local_addr,
-            self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
-            ack,
-            flags,
-            payload,
-        )
+    fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
+        self.build_tcp_packet_with_seq(self.numbers().seq.load(Ordering::Relaxed), flags, payload)
+    }
+
+    fn build_tcp_packet_with_seq(&self, seq: u32, flags: u8, payload: Option<&[u8]>) -> Bytes {
+        let numbers = self.numbers();
+        let ack = numbers.ack.load(Ordering::Relaxed);
+        numbers.last_ack.store(ack, Ordering::Relaxed);
+
+        build_tcp_packet(self.local_addr, self.remote_addr, seq, ack, flags, payload)
+    }
+
+    /// The local address of the connection, as seen on the Tun interface
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// The address of the other end
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    /// Moves the sequence and acknowledgement numbers into `shared`, so that whatever else uses
+    /// them can send and receive data on this connection as well. `shared` is kept until the
+    /// socket is dropped.
+    pub fn share_numbers(&mut self, shared: Arc<dyn SharedNumbers>) {
+        let (old, new) = (self.numbers(), shared.numbers());
+        for (o, n) in [
+            (&old.seq, &new.seq),
+            (&old.ack, &new.ack),
+            (&old.last_ack, &new.last_ack),
+            (&old.flags, &new.flags),
+        ] {
+            n.store(o.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        self.numbers = NumbersStorage::Shared(shared);
     }
 
     /// Sends a datagram to the other end.
@@ -172,8 +240,18 @@ impl Socket {
     pub async fn send(&self, payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
-                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
-                self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+                // Take the sequence number atomically, as other threads or an eBPF program may
+                // send at the same time
+                let seq = self
+                    .numbers()
+                    .seq
+                    .fetch_add(payload.len() as u32, Ordering::Relaxed);
+                let flags = if self.numbers().flags.load(Ordering::Relaxed) & FLAG_PSH != 0 {
+                    tcp::TcpFlags::PSH | tcp::TcpFlags::ACK
+                } else {
+                    tcp::TcpFlags::ACK
+                };
+                let buf = self.build_tcp_packet_with_seq(seq, flags, Some(payload));
                 self.tun.send(&buf).await.ok().and(Some(()))
             }
             _ => unreachable!(),
@@ -201,8 +279,14 @@ impl Socket {
                     let payload = tcp_packet.payload();
 
                     let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
-                    let last_ask = self.last_ack.load(Ordering::Relaxed);
-                    self.ack.store(new_ack, Ordering::Relaxed);
+                    let numbers = self.numbers();
+                    let last_ask = numbers.last_ack.load(Ordering::Relaxed);
+                    numbers.ack.store(new_ack, Ordering::Relaxed);
+                    // only sent once the handshake is complete on the other end
+                    if !payload.is_empty() && numbers.flags.load(Ordering::Relaxed) & FLAG_PSH == 0
+                    {
+                        numbers.flags.fetch_or(FLAG_PSH, Ordering::Relaxed);
+                    }
 
                     if new_ack.overflowing_sub(last_ask).0 > MAX_UNACKED_LEN {
                         let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
@@ -242,12 +326,14 @@ impl Socket {
                             return;
                         }
 
-                        if tcp_packet.get_flags() == tcp::TcpFlags::ACK
+                        // a lost ACK may be replaced by the first data packet, which carries PSH
+                        if tcp_packet.get_flags() & !tcp::TcpFlags::PSH == tcp::TcpFlags::ACK
                             && tcp_packet.get_acknowledgement()
-                                == self.seq.load(Ordering::Relaxed) + 1
+                                == self.numbers().seq.load(Ordering::Relaxed) + 1
                         {
                             // found our ACK
-                            self.seq.fetch_add(1, Ordering::Relaxed);
+                            self.numbers().seq.fetch_add(1, Ordering::Relaxed);
+                            self.numbers().flags.fetch_or(FLAG_PSH, Ordering::Relaxed);
                             self.state = State::Established;
 
                             info!("Connection from {:?} established", self.remote_addr);
@@ -288,11 +374,12 @@ impl Socket {
 
                             if tcp_packet.get_flags() == tcp::TcpFlags::SYN | tcp::TcpFlags::ACK
                                 && tcp_packet.get_acknowledgement()
-                                    == self.seq.load(Ordering::Relaxed) + 1
+                                    == self.numbers().seq.load(Ordering::Relaxed) + 1
                             {
                                 // found our SYN + ACK
-                                self.seq.fetch_add(1, Ordering::Relaxed);
-                                self.ack
+                                self.numbers().seq.fetch_add(1, Ordering::Relaxed);
+                                self.numbers()
+                                    .ack
                                     .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
 
                                 // send ACK to finish handshake
@@ -325,13 +412,13 @@ impl Drop for Socket {
         let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
         // dissociates ourself from the dispatch map
         assert!(self.shared.tuples.write().unwrap().remove(&tuple).is_some());
-        // purge cache
-        self.shared.tuples_purge.send(tuple).unwrap();
+        // purge cache, which fails if no reader task is left, e.g. when shutting down
+        let _ = self.shared.tuples_purge.send(tuple);
 
         let buf = build_tcp_packet(
             self.local_addr,
             self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
+            self.numbers().seq.load(Ordering::Relaxed),
             0,
             tcp::TcpFlags::RST,
             None,
