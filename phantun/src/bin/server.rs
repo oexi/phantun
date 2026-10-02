@@ -1,16 +1,16 @@
 use clap::{Arg, ArgAction, Command, crate_version};
-use fake_tcp::Stack;
+use fake_tcp::tun::Tun;
+use fake_tcp::{Merge, Stack};
 use log::{debug, error, info};
 use phantun::fec::{self, Fec, FecConfig};
-use phantun::forward::forward;
+use phantun::forward::{self, forward};
 use phantun::offload;
-use phantun::utils::{assign_ipv6_address, connect_udp, raise_fd_limit, shutdown_signal};
+use phantun::utils::{assign_address, connect_udp, raise_fd_limit, shutdown_signal};
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio_tun::TunBuilder;
 
 /// The UDP socket of a new connection, connected to `remote_addr` from a free port, and the address
 /// the remote end sees its datagrams coming from
@@ -114,6 +114,7 @@ async fn main() -> io::Result<()> {
         )
         .args(fec::args())
         .args(offload::args())
+        .args(forward::args())
         .get_matches();
 
     let local_port: u16 = matches
@@ -141,18 +142,19 @@ async fn main() -> io::Result<()> {
         .parse()
         .expect("bad peer address for Tun interface");
 
-    let (tun_local6, tun_peer6) = if matches.get_flag("ipv4_only") {
-        (None, None)
-    } else {
-        (
-            matches
-                .get_one::<String>("tun_local6")
-                .map(|v| v.parse().expect("bad local address for Tun interface")),
-            matches
-                .get_one::<String>("tun_peer6")
-                .map(|v| v.parse().expect("bad peer address for Tun interface")),
-        )
-    };
+    let (tun_local6, tun_peer6): (Option<Ipv6Addr>, Option<Ipv6Addr>) =
+        if matches.get_flag("ipv4_only") {
+            (None, None)
+        } else {
+            (
+                matches
+                    .get_one::<String>("tun_local6")
+                    .map(|v| v.parse().expect("bad local address for Tun interface")),
+                matches
+                    .get_one::<String>("tun_peer6")
+                    .map(|v| v.parse().expect("bad peer address for Tun interface")),
+            )
+        };
 
     let tun_name = matches.get_one::<String>("tun").unwrap();
     let handshake_packet: Option<Vec<u8>> = matches
@@ -168,25 +170,33 @@ async fn main() -> io::Result<()> {
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
-    let tun = TunBuilder::new()
-        .name(tun_name) // if name is empty, then it is set by kernel.
-        .up() // or set it up manually using `sudo ip link set <tun-name> up`.
-        .address(tun_local)
-        .destination(tun_peer)
-        .queues(num_cpus)
-        .build()
-        .unwrap();
+    let gso = forward::gso(&matches);
+    // if name is empty, then it is set by kernel.
+    let tun = Tun::create(tun_name, num_cpus, gso).unwrap();
+    assign_address(tun[0].name(), tun_local.into(), tun_peer.into());
 
     if let (Some(tun_local6), Some(tun_peer6)) = (tun_local6, tun_peer6) {
-        assign_ipv6_address(tun[0].name(), tun_local6, tun_peer6);
+        assign_address(tun[0].name(), tun_local6.into(), tun_peer6.into());
     }
 
     info!("Created TUN device {}", tun[0].name());
+    if tun[0].gro() {
+        info!("Packets pass the Tun interface in batches");
+    } else if gso {
+        info!("Packets pass the Tun interface one by one, as the kernel does not support batches");
+    }
 
     let offload = offload::start(&matches, tun[0].name(), fec_config.is_some(), None);
 
     //thread::sleep(time::Duration::from_secs(5));
-    let mut stack = Stack::new(tun, tun_local, tun_local6);
+    let merge = match (tun[0].gro(), &offload) {
+        (false, _) => Merge::Never,
+        (true, None) => Merge::Always,
+        // the eBPF programs cannot convert merged packets, so only clients that merge themselves,
+        // which likely lack eBPF, have them sent: they save more than the server loses
+        (true, Some(_)) => Merge::WithPeer,
+    };
+    let mut stack = Stack::new(tun, tun_local, tun_local6, merge);
     stack.listen(local_port);
     info!("Listening on {}", local_port);
 
@@ -224,7 +234,7 @@ async fn main() -> io::Result<()> {
             let fec = fec_config.map(|c| Arc::new(Fec::new(c, sock.to_string())));
             offload::start_connection(offloaded.as_ref(), &sock, fec.as_ref(), &udp_sock);
 
-            tokio::spawn(forward(sock, udp_sock, remote_addr, fec, offloaded));
+            tokio::spawn(forward(sock, udp_sock, remote_addr, fec, offloaded, gso));
         }
     });
 

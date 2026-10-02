@@ -100,14 +100,25 @@ pub fn start_connection(
         return;
     };
     match conn.start(sock, fec.map(|fec| (fec, udp_sock.clone()))) {
-        Ok(()) if fec.is_some() => log::info!(
-            "Packets of {sock} are converted by eBPF {}, with FEC computed by Phantun",
-            conn.location()
-        ),
-        Ok(()) => log::info!(
-            "Packets of {sock} are converted by eBPF {}",
-            conn.location()
-        ),
+        Ok(()) => {
+            let fec = if fec.is_some() {
+                ", with FEC computed by Phantun"
+            } else {
+                ""
+            };
+            if sock.merges() {
+                log::info!(
+                    "Packets sent on {sock} are converted by eBPF {}, those received pass through \
+                     Phantun, as the other end sends them merged{fec}",
+                    conn.location()
+                );
+            } else {
+                log::info!(
+                    "Packets of {sock} are converted by eBPF {}{fec}",
+                    conn.location()
+                );
+            }
+        }
         Err(e) => log::info!("Packets of {sock} pass through Phantun: {e}"),
     }
 }

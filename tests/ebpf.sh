@@ -65,6 +65,8 @@ def client(host, port, count, size):
 # Counts datagrams until "end", and replies with the count
 def sink(host, port):
     s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
+    # room for a burst, beyond net.core.rmem_max (SO_RCVBUFFORCE)
+    s.setsockopt(socket.SOL_SOCKET, 33, 4 * 1024 * 1024)
     s.bind((host, port))
     n = 0
     while True:
@@ -86,6 +88,22 @@ def oneway(host, port, count, size):
     s.send(b"end")
     try:
         print(int(s.recv(64)))
+    except socket.timeout:
+        print(0)
+
+# Sends a datagram, waits for the connection to be set up, sends `count` more at once, then
+# "end", and prints how many of those arrived
+def burst(host, port, count, size):
+    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2)
+    s.connect((host, port))
+    s.send(bytes(size))
+    time.sleep(0.5)
+    for i in range(count):
+        s.send(bytes(size))
+    s.send(b"end")
+    try:
+        print(int(s.recv(64)) - 1)
     except socket.timeout:
         print(0)
 
@@ -182,15 +200,18 @@ loss() {
   ip netns exec $NS_S tc qdisc replace dev phantun-ts root netem loss "$1%"
 }
 
-# run <name> <server address> <echo address> <local address> <expect eBPF: nic|tun|no> [phantun args]
+# run <name> <server address> <echo address> <local address> <expect eBPF: nic|server|tun|no>
+#   [phantun args]: with `server`, only the server converts on the network interface, and only the
+#   packets it sends, as the client merges packets. SERVER_ARGS and CLIENT_ARGS are passed to one
+#   side only.
 run() {
   local name=$1 server=$2 remote=$3 local=$4 expect=$5
   shift 5
   echo "=== $name"
   ip netns exec $NS_S env RUST_LOG=info "$BIN_DIR/server" --local 4567 --remote "$remote" --tun phantun-ts0 "$@" \
-    > "$WORK/server.log" 2>&1 &
+    ${SERVER_ARGS:-} > "$WORK/server.log" 2>&1 &
   ip netns exec $NS_C env RUST_LOG=info "$BIN_DIR/client" --local "$local" --remote "$server" --tun phantun-tc0 "$@" \
-    > "$WORK/client.log" 2>&1 &
+    ${CLIENT_ARGS:-} > "$WORK/client.log" 2>&1 &
   sleep 1
 
   local host=${local%:*} port=${local##*:}
@@ -217,6 +238,13 @@ run() {
     nic)
       if [ "${s_nic:-0}" -lt $((COUNT - 5)) ] || [ "${c_nic:-0}" -lt $((COUNT - 5)) ] \
         || [ "${s_tun:-0}" -gt 5 ] || [ "${c_tun:-0}" -gt 5 ]; then
+        result=fail
+      fi
+      ;;
+    server)
+      # the program on the network interface passes those received to Phantun
+      if [ "${s_nic:-0}" -lt $((COUNT - 5)) ] || [ -n "$c_nic$c_tun" ] || [ "${s_tun:-0}" -gt 5 ] \
+        || ! grep -q "those received pass through Phantun" "$WORK/server.log"; then
         result=fail
       fi
       ;;
@@ -275,6 +303,64 @@ oneway() {
   fi
   echo "received $ok/$COUNT: $result"
   if [ $result = fail ]; then
+    echo "--- server log"; cat "$WORK/server.log"
+    echo "--- client log"; cat "$WORK/client.log"
+  fi
+}
+
+# tun_packets <namespace> <interface> <rx|tx>: the number of packets the interface counted
+tun_packets() {
+  ip -n "$1" -s -j link show "$2" \
+    | python3 -c "import json, sys; print(json.load(sys.stdin)[0]['stats64']['$3']['packets'])"
+}
+
+# burst <name> [phantun args]: datagrams sent at once from the client to the server. Without
+# eBPF, the client writes them to the Tun interface together for the kernel to split, and the
+# server reads them merged by GRO, or here as they were written, as the veth link keeps them
+# together, so both take fewer packets than there are datagrams. Expects the packets to be merged
+# unless `--no-gso` is among the arguments.
+burst() {
+  local name=$1
+  shift
+  echo "=== $name"
+  ip netns exec $NS_S env RUST_LOG=info "$BIN_DIR/server" --local 4567 --remote 127.0.0.1:7778 --tun phantun-ts0 "$@" \
+    ${SERVER_ARGS:-} > "$WORK/server.log" 2>&1 &
+  ip netns exec $NS_C env RUST_LOG=info "$BIN_DIR/client" --local 127.0.0.1:1984 --remote 10.199.0.2:4567 --tun phantun-tc0 "$@" \
+    ${CLIENT_ARGS:-} > "$WORK/client.log" 2>&1 &
+  sleep 1
+
+  # written by the client, read by the server
+  local c0 s0 c1 s1 ok
+  c0=$(tun_packets $NS_C phantun-tc0 rx)
+  s0=$(tun_packets $NS_S phantun-ts0 tx)
+  ok=$(ip netns exec $NS_C python3 "$WORK/echo.py" burst 127.0.0.1 1984 $COUNT 1000)
+  c1=$(tun_packets $NS_C phantun-tc0 rx)
+  s1=$(tun_packets $NS_S phantun-ts0 tx)
+  local written=$((c1 - c0)) read=$((s1 - s0))
+
+  pkill -f "^$BIN_DIR/(server|client) " || true
+  sleep 0.5
+
+  local result=pass
+  if [ "$ok" -lt $((COUNT - 5)) ]; then
+    result=fail
+  fi
+  case " $* ${SERVER_ARGS:-} ${CLIENT_ARGS:-} " in
+    *" --no-gso "*)
+      if [ $written -lt "$ok" ] || [ $read -lt "$ok" ]; then
+        result=fail
+      fi
+      ;;
+    *)
+      # how many go together depends on how far Phantun lags behind
+      if [ $written -gt $((ok * 9 / 10)) ] || [ $read -gt $((ok * 9 / 10)) ]; then
+        result=fail
+      fi
+      ;;
+  esac
+  echo "received $ok/$COUNT, packets written by the client: $written, read by the server: $read: $result"
+  if [ $result = fail ]; then
+    failed=1
     echo "--- server log"; cat "$WORK/server.log"
     echo "--- client log"; cat "$WORK/client.log"
   fi
@@ -351,6 +437,14 @@ run "--no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --no-ebpf
 # Through conntrack on both ends
 oneway "One way, --no-ebpf-nic" --no-ebpf-nic
 oneway "One way, --no-ebpf" --no-ebpf
+burst "At once, --no-ebpf" --no-ebpf
+burst "At once, --no-ebpf --no-gso" --no-ebpf --no-gso
+# Like a router in user space with a host converting with eBPF
+CLIENT_ARGS=--no-ebpf run "Client --no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 server
+# With an end that does not merge packets, like older versions
+CLIENT_ARGS=--no-gso run "Client --no-gso" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic
+CLIENT_ARGS=--no-gso burst "At once, --no-ebpf, client --no-gso" --no-ebpf
+CLIENT_ARGS=--no-ebpf burst "At once, client --no-ebpf"
 fd_limit
 lost_ack
 loss 5
@@ -358,6 +452,7 @@ run "FEC with 5% loss" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic --fec 4
 run "FEC with 5% loss, IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic --fec 4:2
 run "FEC with 5% loss, --no-ebpf-nic" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 tun --fec 4:2 --no-ebpf-nic
 run "FEC with 5% loss, --no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --fec 4:2 --no-ebpf
+CLIENT_ARGS=--no-ebpf run "FEC with 5% loss, client --no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 server --fec 4:2
 loss 0
 
 if command -v wg > /dev/null && setup_wg 2> /dev/null; then

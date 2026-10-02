@@ -35,6 +35,8 @@ struct Tuple {
 
 /// CONV_NIC
 const CONV_NIC: u32 = 1;
+/// CONV_USER_RX
+const CONV_USER_RX: u32 = 2;
 
 /// struct conversion
 #[repr(C)]
@@ -60,11 +62,12 @@ type FecClaims = u64;
 #[repr(C)]
 struct State {
     numbers: Numbers,
+    _pad1: u32,
     // Written by the eBPF programs without atomics
     tx: UnsafeCell<u64>,
     rx: UnsafeCell<u64>,
     fec_claims: FecClaims,
-    _pad2: [u64; 3],
+    _pad2: [u64; 2],
 }
 
 /// The header of struct record, followed by the data
@@ -639,6 +642,16 @@ impl Offload {
                 Location::Tun(e)
             }
         };
+
+        // The other end may send merged packets, which only user space can take, and all of them
+        // have to take the same path to stay in order
+        if sock.merges() {
+            for (table, _, conversion) in &mut entries {
+                if *table == Table::Tcp {
+                    conversion.flags |= CONV_USER_RX;
+                }
+            }
+        }
 
         let conn = Arc::new(Connection {
             offload: self.clone(),
