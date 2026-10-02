@@ -459,7 +459,8 @@ INFO  phantun::offload > Packets of (...) are converted by eBPF on the Tun inter
 ```
 
 and the packets are converted on the Tun interface instead, after routing and NAT, which is also
-what `--no-ebpf-nic` does. Those packets still pass through the kernel's forwarding path, which is
+what `--no-ebpf-nic` does, and what happens to all connections if the kernel rejects the programs
+for network interfaces, which is logged at startup. Those packets still pass through the kernel's forwarding path, which is
 slower, as the table above shows.
 
 Network interfaces with an Ethernet header are supported, and those without one (`ARPHRD_NONE`,
