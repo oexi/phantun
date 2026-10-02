@@ -29,26 +29,21 @@
 
 use clap::{Arg, ArgMatches, value_parser};
 use fake_tcp::Socket;
-use fake_tcp::packet::{MAX_HEADER_LEN, MAX_PACKET_LEN};
+use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{info, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
-use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::time;
 
 const TYPE_DATA: u8 = 0;
 const TYPE_PARITY: u8 = 1;
-/// Length of the header of a data shard
+/// Bytes reserved in front of every outgoing datagram buffer for the data shard header
 pub const HEADROOM: usize = 6;
-/// Bytes reserved in front of every outgoing datagram for the headers of its packet, see
-/// [`send_datagram`]
-pub const SEND_HEADROOM: usize = MAX_HEADER_LEN + HEADROOM;
 const PARITY_HEADER_LEN: usize = 8;
 const LEN_PREFIX: usize = 2;
 /// Extra bytes FEC adds on top of the largest datagram, which is the size of a parity shard header
@@ -1162,49 +1157,53 @@ impl Drop for Fec {
     }
 }
 
-/// Sends the datagram `buf[SEND_HEADROOM..]` to the peer, encoding it with FEC if enabled.
-/// The first `SEND_HEADROOM` bytes of `buf` are scratch space for the headers, which are written
-/// in front of the datagram rather than copying it.
+/// Sends the datagram `buf[HEADROOM..]` to the peer, encoding it with FEC if enabled.
+/// The first `HEADROOM` bytes of `buf` are scratch space for the FEC header.
 ///
 /// A return of `None` means `sock` must be closed.
 pub async fn send_datagram(sock: &Socket, fec: Option<&Fec>, buf: &mut [u8]) -> Option<()> {
+    send_datagrams(sock, fec, &mut [buf]).await
+}
+
+/// Like [`send_datagram`] for several datagrams at once, which are passed to the kernel together
+/// if possible, see [`Socket::send_many`]
+pub async fn send_datagrams(
+    sock: &Socket,
+    fec: Option<&Fec>,
+    bufs: &mut [&mut [u8]],
+) -> Option<()> {
     let Some(fec) = fec else {
-        return sock.send_in_place(buf, SEND_HEADROOM).await;
+        let datagrams: Vec<&[u8]> = bufs.iter().map(|buf| &buf[HEADROOM..]).collect();
+        return sock.send_many(&datagrams).await;
     };
 
     let now = Instant::now();
-    let closed = {
+    let mut closed = Vec::new();
+    {
         let mut encoder = fec.encoder.lock().unwrap();
-        let closed = encoder.push(&mut buf[MAX_HEADER_LEN..], now);
+        for buf in bufs.iter_mut() {
+            closed.extend(encoder.push(buf, now));
+        }
         if std::mem::take(&mut encoder.started_group) {
             fec.wake.notify_one();
         }
-        closed
-    };
+    }
 
-    sock.send_in_place(buf, MAX_HEADER_LEN).await?;
-    if let Some(closed) = closed {
-        for p in fec.schedule(closed.encode(), now) {
-            sock.send(&p).await?;
-        }
+    let frames: Vec<&[u8]> = bufs.iter().map(|buf| &buf[..]).collect();
+    sock.send_many(&frames).await?;
+    for closed in closed {
+        let parity = fec.schedule(closed.encode(), now);
+        let parity: Vec<&[u8]> = parity.iter().map(Vec::as_slice).collect();
+        sock.send_many(&parity).await?;
     }
 
     Some(())
 }
 
-/// Forwards a payload received from the peer to `udp_sock`, decoding FEC if enabled.
-/// `recovered` is scratch space reused between calls.
-pub async fn forward_to_udp(
-    udp_sock: &UdpSocket,
-    fec: Option<&Fec>,
-    frame: &[u8],
-    recovered: &mut Vec<Vec<u8>>,
-) -> io::Result<()> {
-    let Some(fec) = fec else {
-        udp_sock.send(frame).await?;
-        return Ok(());
-    };
-
+/// Decodes a frame received from the peer, and passes on the datagrams it yields: that of a data
+/// shard, followed by those of the data shards it recovers. `recovered` is scratch space reused
+/// between calls.
+pub fn decode(fec: &Fec, frame: &[u8], recovered: &mut Vec<Vec<u8>>, mut out: impl FnMut(&[u8])) {
     let (datagram, recovery) = {
         let mut decoder = fec.decoder.lock().unwrap();
         let decoded = decoder.feed(frame);
@@ -1218,16 +1217,14 @@ pub async fn forward_to_udp(
         decoded
     };
     if let Some(datagram) = datagram {
-        udp_sock.send(datagram).await?;
+        out(datagram);
     }
     if let Some(recovery) = recovery {
         recovery.run(recovered);
         for datagram in recovered.drain(..) {
-            udp_sock.send(&datagram).await?;
+            out(&datagram);
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

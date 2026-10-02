@@ -5,9 +5,9 @@ use pnet::packet::{ip, ipv4, ipv6, tcp};
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 
-const IPV4_HEADER_LEN: usize = 20;
-const IPV6_HEADER_LEN: usize = 40;
-const TCP_HEADER_LEN: usize = 20;
+pub const IPV4_HEADER_LEN: usize = 20;
+pub const IPV6_HEADER_LEN: usize = 40;
+pub const TCP_HEADER_LEN: usize = 20;
 pub const MAX_PACKET_LEN: usize = 1500;
 
 pub enum IPPacket<'p> {
@@ -31,8 +31,10 @@ impl IPPacket<'_> {
     }
 }
 
-/// Room to leave in front of a payload for the IP and TCP headers of a data packet, which have no
-/// options, see [`write_tcp_headers`]
+/// The window of every packet, which the window scale option in the handshake scales by 2^14
+pub const WINDOW: u16 = 0xffff;
+
+/// The longest IP and TCP headers of a data packet, which have no options
 pub const MAX_HEADER_LEN: usize = IPV6_HEADER_LEN + TCP_HEADER_LEN;
 
 /// The length of the IP and TCP headers of a packet from `local_addr` with `flags`
@@ -53,36 +55,71 @@ pub fn build_tcp_packet(
     flags: u8,
     payload: Option<&[u8]>,
 ) -> Bytes {
-    let header_len = header_len(local_addr, flags);
-    let payload = payload.unwrap_or_default();
-    let mut buf = BytesMut::zeroed(header_len + payload.len());
-    buf[header_len..].copy_from_slice(payload);
-    write_tcp_headers(&mut buf, local_addr, remote_addr, seq, ack, flags);
-    buf.freeze()
+    build_tcp_packet_with_window(local_addr, remote_addr, seq, ack, flags, WINDOW, payload)
 }
 
-/// Writes the IP and TCP headers of a packet to the start of `buf`, which holds the whole packet:
-/// the headers are [`header_len`] bytes long and followed by the payload, which is left as it is.
-pub fn write_tcp_headers(
-    buf: &mut [u8],
+/// Like [`build_tcp_packet`], with another window than [`WINDOW`]
+pub fn build_tcp_packet_with_window(
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     seq: u32,
     ack: u32,
     flags: u8,
-) {
-    let ip_header_len = match local_addr {
+    window: u16,
+    payload: Option<&[u8]>,
+) -> Bytes {
+    let header_len = header_len(local_addr, flags);
+    let payload = payload.unwrap_or_default();
+    let mut buf = BytesMut::zeroed(header_len + payload.len());
+    let (header, body) = buf.split_at_mut(header_len);
+    body.copy_from_slice(payload);
+    write_headers(
+        header,
+        Headers {
+            local_addr,
+            remote_addr,
+            ip_id: 0,
+            seq,
+            ack,
+            flags,
+            window,
+        },
+        payload.len(),
+        Some(&[payload]),
+    );
+    buf.freeze()
+}
+
+/// The fields of the IP and TCP headers of a packet
+#[derive(Clone, Copy)]
+pub struct Headers {
+    pub local_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
+    /// The IPv4 ID, or that of the first packet if the kernel splits it
+    pub ip_id: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub window: u16,
+}
+
+/// Writes the IP and TCP headers of a packet with `payload_len` bytes of payload to `buf`, which
+/// is [`header_len`] bytes long. With `payload`, its pieces in order, the TCP checksum is computed;
+/// without, the checksum field only holds the sum of the pseudo header, which is what the kernel
+/// expects to complete with `VIRTIO_NET_HDR_F_NEEDS_CSUM`.
+pub fn write_headers(buf: &mut [u8], h: Headers, payload_len: usize, payload: Option<&[&[u8]]>) {
+    let ip_header_len = match h.local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
     };
-    let wscale = (flags & tcp::TcpFlags::SYN) != 0;
-    let total_len = buf.len();
+    let wscale = (h.flags & tcp::TcpFlags::SYN) != 0;
+    let total_len = buf.len() + payload_len;
     let tcp_total_len = total_len - ip_header_len;
-    // the buffer may hold anything where the headers go
-    buf[..header_len(local_addr, flags)].fill(0);
+    // the buffer may hold anything
+    buf.fill(0);
     let (ip_buf, tcp_buf) = buf.split_at_mut(ip_header_len);
 
-    match (local_addr, remote_addr) {
+    match (h.local_addr, h.remote_addr) {
         (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
             let mut v4 = ipv4::MutableIpv4Packet::new(ip_buf).unwrap();
             v4.set_version(4);
@@ -92,6 +129,7 @@ pub fn write_tcp_headers(
             v4.set_source(*local.ip());
             v4.set_destination(*remote.ip());
             v4.set_total_length(total_len.try_into().unwrap());
+            v4.set_identification(h.ip_id);
             v4.set_flags(ipv4::Ipv4Flags::DontFragment);
             let mut cksm = Checksum::new();
             cksm.add_bytes(v4.packet());
@@ -110,12 +148,12 @@ pub fn write_tcp_headers(
     };
 
     let mut tcp = tcp::MutableTcpPacket::new(tcp_buf).unwrap();
-    tcp.set_window(0xffff);
-    tcp.set_source(local_addr.port());
-    tcp.set_destination(remote_addr.port());
-    tcp.set_sequence(seq);
-    tcp.set_acknowledgement(ack);
-    tcp.set_flags(flags);
+    tcp.set_window(h.window);
+    tcp.set_source(h.local_addr.port());
+    tcp.set_destination(h.remote_addr.port());
+    tcp.set_sequence(h.seq);
+    tcp.set_acknowledgement(h.ack);
+    tcp.set_flags(h.flags);
     tcp.set_data_offset(TCP_HEADER_LEN as u8 / 4 + if wscale { 1 } else { 0 });
     if wscale {
         let wscale = tcp::TcpOption::wscale(14);
@@ -125,7 +163,7 @@ pub fn write_tcp_headers(
     let mut cksm = Checksum::new();
     let ip::IpNextHeaderProtocol(tcp_protocol) = ip::IpNextHeaderProtocols::Tcp;
 
-    match (local_addr, remote_addr) {
+    match (h.local_addr, h.remote_addr) {
         (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
             cksm.add_bytes(&local.ip().octets());
             cksm.add_bytes(&remote.ip().octets());
@@ -145,8 +183,17 @@ pub fn write_tcp_headers(
         _ => unreachable!(),
     };
 
-    cksm.add_bytes(tcp.packet());
-    tcp.set_checksum(u16::from_be_bytes(cksm.checksum()));
+    match payload {
+        Some(payload) => {
+            cksm.add_bytes(tcp.packet());
+            for piece in payload {
+                cksm.add_bytes(piece);
+            }
+            tcp.set_checksum(u16::from_be_bytes(cksm.checksum()));
+        }
+        // the sum, rather than its complement
+        None => tcp.set_checksum(!u16::from_be_bytes(cksm.checksum())),
+    }
 }
 
 /// Parses a TCP packet, `None` if it is something else or malformed
@@ -208,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn write_headers_in_place() {
+    fn write_headers_separately() {
         for (local, remote) in [
             ("192.168.201.2:4567", "10.0.0.1:40000"),
             ("[fcc9::2]:4567", "[2001:db8::1]:40000"),
@@ -216,14 +263,37 @@ mod tests {
             let local: SocketAddr = local.parse().unwrap();
             let remote: SocketAddr = remote.parse().unwrap();
             for flags in [tcp::TcpFlags::ACK, tcp::TcpFlags::PSH | tcp::TcpFlags::ACK] {
-                let packet = build_tcp_packet(local, remote, 123, 456, flags, Some(b"data"));
+                let packet = build_tcp_packet(local, remote, 123, 456, flags, Some(b"odd data"));
+                let h = Headers {
+                    local_addr: local,
+                    remote_addr: remote,
+                    ip_id: 0,
+                    seq: 123,
+                    ack: 456,
+                    flags,
+                    window: WINDOW,
+                };
 
-                // whatever is in front of the payload is overwritten
-                let mut buf = [0xa5u8; MAX_HEADER_LEN + 4];
-                buf[MAX_HEADER_LEN..].copy_from_slice(b"data");
-                let start = MAX_HEADER_LEN - header_len(local, flags);
-                write_tcp_headers(&mut buf[start..], local, remote, 123, 456, flags);
-                assert_eq!(buf[start..], packet[..]);
+                // whatever is in the buffer is overwritten, and the payload may come in pieces
+                let mut header = vec![0xa5u8; header_len(local, flags)];
+                write_headers(&mut header, h, 8, Some(&[b"odd", b" ", b"data"]));
+                assert_eq!(header[..], packet[..header.len()]);
+
+                // the partial checksum is the sum of the pseudo header, which the sum of the TCP
+                // header and payload completes
+                write_headers(&mut header, h, 8, None);
+                let (ip_len, check_off) = match local {
+                    SocketAddr::V4(_) => (IPV4_HEADER_LEN, IPV4_HEADER_LEN + 16),
+                    SocketAddr::V6(_) => (IPV6_HEADER_LEN, IPV6_HEADER_LEN + 16),
+                };
+                let partial = u16::from_be_bytes([header[check_off], header[check_off + 1]]);
+                header[check_off..check_off + 2].fill(0);
+                assert_eq!(header[..check_off], packet[..check_off]);
+                let mut cksm = Checksum::new();
+                cksm.add_bytes(&partial.to_be_bytes());
+                cksm.add_bytes(&header[ip_len..]);
+                cksm.add_bytes(b"odd data");
+                assert_eq!(cksm.checksum(), packet[check_off..check_off + 2]);
             }
         }
     }

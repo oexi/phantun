@@ -158,6 +158,8 @@ struct __sk_buff {
 #define MAX_PACKET_LEN 1500
 // Must match fake-tcp's MAX_UNACKED_LEN
 #define MAX_UNACKED_LEN (128 * 1024 * 1024)
+// Must match fake-tcp's ACK_HOLD
+#define ACK_HOLD (32 * 1024)
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_skb_store_bytes)(struct __sk_buff *skb, __u32 offset, const void *from, __u32 len,
@@ -235,6 +237,9 @@ struct tuple {
 
 // The fake TCP packets of the connection are on a network interface rather than the Tun interface
 #define CONV_NIC 1
+// The fake TCP packets received are all left to user space, as the other end may send them merged
+// by GRO, which cannot be converted, and they have to stay in order
+#define CONV_USER_RX 2
 
 // What a matching packet is turned into
 struct conversion {
@@ -264,6 +269,12 @@ struct state {
 	__u32 last_ack;
 	// STATE_FLAG_*
 	__u32 flags;
+	// The IP ID of the next fake TCP packet over IPv4, of which the lower 16 bits are used. It goes
+	// up by one for each, as the receiving kernel only merges packets with GRO when their IDs go up
+	// one by one, or stay the same, and only passes merged packets with the same IDs to the Tun
+	// interface after splitting them again.
+	__u32 ip_id;
+	__u32 _pad1;
 	// Packets converted by udp_to_tcp and tcp_to_udp. They are only used to see whether there is
 	// any traffic and for statistics, so the increments do not need to be atomic.
 	__u64 tx;
@@ -271,7 +282,7 @@ struct state {
 	// The FEC group (upper half) and the number of data shards in it so far (lower half), shared
 	// with user space, which also sends data shards and closes groups that are not filled in time
 	__u64 fec_claims;
-	__u64 _pad2[3];
+	__u64 _pad2[2];
 };
 
 // FEC frames for user space, which computes parity shards from data shards sent, and recovers
@@ -298,6 +309,10 @@ struct record {
 
 // fake-tcp's FLAG_PSH: the other end has completed the handshake, so data packets carry PSH
 #define STATE_FLAG_PSH 1
+// fake-tcp's FLAG_MERGE: the other end takes packets merged by GRO, so data packets never carry
+// PSH, and their acknowledgement number only moves on every ACK_HOLD bytes, as GRO only merges
+// packets with the same one
+#define STATE_FLAG_MERGE 2
 
 #define MAX_CONNECTIONS 4096
 
@@ -433,12 +448,13 @@ static __always_inline __u32 ip_header_len(__u32 family)
 
 // Writes the IP header of a converted packet. `payload_len` is the length after the IP header.
 static __always_inline int write_ip(struct __sk_buff *skb, __u32 off, const struct tuple *out,
-				    __u8 protocol, __u32 payload_len)
+				    __u8 protocol, __u32 payload_len, __u16 id)
 {
 	if (out->family == 4) {
 		struct iphdr ip = {
 			.ver_ihl = 0x45,
 			.tot_len = bpf_htons(sizeof(ip) + payload_len),
+			.id = bpf_htons(id),
 			.frag_off = bpf_htons(IP_DF),
 			.ttl = 64,
 			.protocol = protocol,
@@ -562,9 +578,9 @@ static __always_inline int convert_tcp(struct __sk_buff *skb, struct headers *h,
 				       const struct tcphdr *tcp, const struct conversion *c,
 				       __u32 mark_flags)
 {
-	// Only plain data packets, everything else is for user space. PSH is optional, see
-	// Socket::send.
-	if (skb->gso_size || tcp->doff != 0x50 || (tcp->flags & ~TCP_FLAG_PSH) != TCP_FLAG_ACK)
+	// Only plain data packets, everything else is for user space. PSH is optional, see fake-tcp's
+	// FLAG_PSH.
+	if ((c->flags & CONV_USER_RX) || skb->gso_size || tcp->doff != 0x50 || (tcp->flags & ~TCP_FLAG_PSH) != TCP_FLAG_ACK)
 		return CLS_NO_MATCH;
 	__u32 payload_len = h->len - (h->l4_off - h->l3_off) - sizeof(*tcp);
 	if (payload_len == 0 || payload_len > MAX_PACKET_LEN)
@@ -643,7 +659,7 @@ static __always_inline int convert_tcp(struct __sk_buff *skb, struct headers *h,
 	};
 	// The packet has already been changed, so it can only be dropped if these fail. That does not
 	// happen though, as the bytes exist.
-	if (ret || write_ip(skb, h->l3_off, &out, IPPROTO_UDP, sizeof(udp) + payload_len) ||
+	if (ret || write_ip(skb, h->l3_off, &out, IPPROTO_UDP, sizeof(udp) + payload_len, 0) ||
 	    bpf_skb_store_bytes(skb, h->l3_off + ip_header_len(out.family), &udp, sizeof(udp), 0)) {
 		// Not delivered, so it may still be recovered
 		if (rec)
@@ -655,8 +671,8 @@ static __always_inline int convert_tcp(struct __sk_buff *skb, struct headers *h,
 	if (rec)
 		bpf_ringbuf_submit(rec, 0);
 	*(volatile __u32 *)&s->ack = ack;
-	// Data from the other end means it has completed the handshake, see Socket::recv
-	if (!(*(volatile __u32 *)&s->flags & STATE_FLAG_PSH))
+	// Data from the other end means it has completed the handshake, see Socket::recv_batch
+	if (!(*(volatile __u32 *)&s->flags & (STATE_FLAG_PSH | STATE_FLAG_MERGE)))
 		__sync_fetch_and_or(&s->flags, STATE_FLAG_PSH);
 	s->rx++;
 	mark(skb, LOOPBACK_IFINDEX, mark_flags);
@@ -785,6 +801,13 @@ int udp_to_tcp(struct __sk_buff *skb)
 
 	__u32 seq = __sync_fetch_and_add(&s->seq, payload_len + grow - HEADER_DIFF);
 	__u32 ack = *(volatile __u32 *)&s->ack;
+	__u32 state_flags = *(volatile __u32 *)&s->flags;
+	// Like Socket::data_ack, also when the number went back, as reordered packets do
+	if (state_flags & STATE_FLAG_MERGE) {
+		__u32 last_ack = *(volatile __u32 *)&s->last_ack;
+		if ((__s32)(ack - last_ack) < ACK_HOLD)
+			ack = last_ack;
+	}
 	*(volatile __u32 *)&s->last_ack = ack;
 
 	struct tcphdr tcp = {
@@ -793,15 +816,16 @@ int udp_to_tcp(struct __sk_buff *skb)
 		.seq = bpf_htonl(seq),
 		.ack_seq = bpf_htonl(ack),
 		.doff = 0x50,
-		// Like Phantun, see Socket::send
-		.flags = TCP_FLAG_ACK | (*(volatile __u32 *)&s->flags & STATE_FLAG_PSH ? TCP_FLAG_PSH : 0),
+		// Like Phantun, see fake-tcp's FLAG_PSH and FLAG_MERGE
+		.flags = TCP_FLAG_ACK | (state_flags & STATE_FLAG_PSH ? TCP_FLAG_PSH : 0),
 		.window = 0xffff,
 		// computed by the csum action
 		.check = 0,
 	};
 	__u32 l4_off = h.l3_off + ip_header_len(out.family);
 	int err = write_ip(skb, h.l3_off, &out, IPPROTO_TCP,
-			   sizeof(tcp) + grow - HEADER_DIFF + payload_len) ||
+			   sizeof(tcp) + grow - HEADER_DIFF + payload_len,
+			   out.family == 4 ? __sync_fetch_and_add(&s->ip_id, 1) : 0) ||
 		  bpf_skb_store_bytes(skb, l4_off, &tcp, sizeof(tcp), 0);
 	if (rec) {
 		__u8 fec[FEC_DATA_HEADER_LEN] = {

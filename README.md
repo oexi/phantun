@@ -32,6 +32,8 @@ A lightweight and fast UDP to TCP obfuscator.
     * [On the network interface](#on-the-network-interface)
     * [Requirements](#requirements)
     * [Changes to the host](#changes-to-the-host)
+* [Packets in batches (GSO and GRO)](#packets-in-batches-gso-and-gro)
+    * [Merged packets](#merged-packets)
 * [Version compatibility](#version-compatibility)
 * [Documentations](#documentations)
 * [Performance](#performance)
@@ -416,7 +418,8 @@ reached:
 
 Without eBPF, TCP inside WireGuard retransmitted about 25000 segments in 10 seconds at 20 ms RTT,
 with eBPF almost none. With 20 ms RTT and no loss, something other than Phantun limits the
-throughput.
+throughput. These figures predate [packets in batches](#packets-in-batches-gso-and-gro), which
+make Phantun much faster without eBPF.
 
 With [FEC](#forward-error-correction-fec), the programs convert data shards and pass a copy of
 them to Phantun, which computes the parity shards from them and recovers lost data shards, so only
@@ -437,8 +440,8 @@ without the privileges needed. `--no-ebpf` disables it.
 
 Handshakes and anything unusual still go through Phantun, so the
 [firewall rules](#2-add-required-firewall-rules) are needed all the same. To keep the receiving
-kernel from merging data packets with GRO, Phantun now sets the PSH flag on them, which older
-versions ignore.
+kernel from merging data packets with GRO, Phantun sets the PSH flag on them, which older versions
+ignore, unless the other end takes [merged packets](#merged-packets).
 
 ## On the network interface
 
@@ -503,6 +506,73 @@ entering it in a hash table, which costs other traffic little.
   (`net.netfilter.nf_conntrack_tcp_timeout_established`, 5 days by default) even while the
   connection is in use. The packets of the connection do not depend on the entry, but traffic
   shaping or accounting with netfilter or on the Tun interface does not see them either.
+
+[Back to TOC](#table-of-contents)
+
+# Packets in batches (GSO and GRO)
+
+Each packet that passes through Phantun takes a system call, and each fake TCP packet also takes
+the kernel's forwarding path, with routing, conntrack and NAT. Phantun passes them to the kernel
+in batches instead, where it can:
+
+* The Tun interface has virtio-net headers (`IFF_VNET_HDR`). Datagrams of the same length that
+  arrive together are written as one packet of up to 64 KB, which the kernel only splits into one
+  packet per datagram on the network interface, or leaves to its hardware (TSO), so that routing,
+  conntrack and NAT only see one. The other way, the kernel merges the packets that arrive
+  together (GRO), and passes them to Phantun as one. Checksums are left to the kernel, or the
+  hardware.
+* Datagrams are received several at a time from the UDP sockets (`recvmmsg`), and those of the
+  same length sent with one system call (UDP GSO).
+
+It is used automatically, and `--no-gso` turns off the splitting and merging. The log says at
+startup whether the Tun interface allows it:
+
+```
+INFO  server > Packets pass the Tun interface in batches
+```
+
+In a test with WireGuard over Phantun between two network namespaces of a 4 core ARM VM, whose
+veth link split and merged packets like the drivers of real network interfaces, `iperf3` reached,
+up / down:
+
+| Client / server                      | Packets one by one | Packets in batches | CPU time of the client per GB, one by one / in batches |
+|--------------------------------------|--------------------|--------------------|--------------------------------------------------------|
+| Both `--no-ebpf`                     | 551 / 553 Mbit/s   | 1.63 / 1.62 Gbit/s | 12.0 / 2.8 s up, 12.8 / 2.8 s down                     |
+| `--no-ebpf` / eBPF                   | 524 / 769 Mbit/s   | 1.73 / 2.00 Gbit/s | 17.0 / 2.9 s up, 11.1 / 2.4 s down                     |
+| Both `--no-ebpf`, FEC `10:2`         | 430 / 442 Mbit/s   | 1.23 / 1.18 Gbit/s | 16.8 / 5.0 s up, 15.9 / 4.0 s down                     |
+| `--no-ebpf` / eBPF, FEC `10:2`       | 369 / 601 Mbit/s   | 1.19 / 1.39 Gbit/s | 24.6 / 5.2 s up, 14.6 / 4.4 s down                     |
+| Both eBPF                            | 1.35 / 1.32 Gbit/s | 1.35 / 1.30 Gbit/s |                                                        |
+
+The first column is the previous version, which passes every packet on its own.
+
+Requirements:
+
+* Linux 4.18 or newer for UDP GSO, which Phantun stops using, with a line in the log, if the kernel
+  refuses it. Without virtio-net headers on the Tun interface, also logged, packets pass it one by
+  one.
+* For the packets that Phantun receives to be merged, the network interface has to support GRO,
+  which most do, and the other end has to take part, see below.
+
+## Merged packets
+
+The kernel only merges the packets of a connection with GRO if they lack the PSH flag and carry the
+same acknowledgement number, and the eBPF programs cannot convert merged packets. So during the
+handshake, each end says whether it takes merged packets, with the window of its SYN or SYN + ACK
+(64240 rather than 65535). If the other end does, data packets lack PSH, their acknowledgement
+number only moves on every 32 KB, and datagrams of the same length are written together. Otherwise,
+packets are sent as before.
+
+An end without eBPF takes merged packets. An end with eBPF does not, except a server whose client
+does: it then converts the packets it sends with eBPF, and passes those it receives through
+Phantun, so that the client, e.g. a router without eBPF, can send in batches. The client saves far
+more than the server spends, as the table above shows. The log says so for each connection:
+
+```
+INFO  phantun::offload > Packets sent on (...) are converted by eBPF on eth0, those received pass through Phantun, as the other end sends them merged
+INFO  phantun::forward > Packets of (...) pass in batches both ways
+```
+
+Older versions do not say anything, so the packets exchanged with them are the same as before.
 
 [Back to TOC](#table-of-contents)
 

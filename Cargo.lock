@@ -336,11 +336,11 @@ dependencies = [
  "bytes",
  "flume",
  "internet-checksum",
+ "libc",
  "log",
  "pnet",
  "rand",
  "tokio",
- "tokio-tun",
 ]
 
 [[package]]
@@ -770,6 +770,7 @@ dependencies = [
  "aya",
  "clap",
  "fake-tcp",
+ "libc",
  "log",
  "neli",
  "nix",
@@ -779,7 +780,6 @@ dependencies = [
  "reed-solomon-erasure",
  "socket2",
  "tokio",
- "tokio-tun",
  "tokio-util",
 ]
 
@@ -1189,18 +1189,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tokio-tun"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef6cadea27ba297ef9124370e49af79913b9b979bffd6511f65702eefbce12fe"
-dependencies = [
- "libc",
- "nix",
- "thiserror",
- "tokio",
 ]
 
 [[package]]

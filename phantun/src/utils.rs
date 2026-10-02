@@ -182,29 +182,46 @@ fn dst_addr_from_cmsgs(cmsgs: CmsgIterator) -> Option<IpAddr> {
     None
 }
 
-pub fn assign_ipv6_address(device_name: &str, local: Ipv6Addr, peer: Ipv6Addr) {
+/// Assigns the address `local` to the point-to-point interface `device_name`, whose other end has
+/// the address `peer`, of the same family
+pub fn assign_address(device_name: &str, local: IpAddr, peer: IpAddr) {
     let index = nix::net::if_::if_nametoindex(device_name).unwrap();
+    let (family, prefix_len, local, peer) = match (local, peer) {
+        (IpAddr::V4(local), IpAddr::V4(peer)) => (
+            RtAddrFamily::Inet,
+            32,
+            local.octets().to_vec(),
+            peer.octets().to_vec(),
+        ),
+        (IpAddr::V6(local), IpAddr::V6(peer)) => (
+            RtAddrFamily::Inet6,
+            128,
+            local.octets().to_vec(),
+            peer.octets().to_vec(),
+        ),
+        _ => panic!("{local} and {peer} are of different families"),
+    };
 
     let rtnl = NlSocketHandle::connect(NlFamily::Route, None, Groups::empty()).unwrap();
     let mut rtattrs = RtBuffer::new();
     rtattrs.push(
         RtattrBuilder::default()
             .rta_type(Ifa::Local)
-            .rta_payload(&local.octets()[..])
+            .rta_payload(local)
             .build()
             .unwrap(),
     );
     rtattrs.push(
         RtattrBuilder::default()
             .rta_type(Ifa::Address)
-            .rta_payload(&peer.octets()[..])
+            .rta_payload(peer)
             .build()
             .unwrap(),
     );
 
     let ifaddrmsg = IfaddrmsgBuilder::default()
-        .ifa_family(RtAddrFamily::Inet6)
-        .ifa_prefixlen(128)
+        .ifa_family(family)
+        .ifa_prefixlen(prefix_len)
         .ifa_flags(IfaF::empty())
         .ifa_scope(RtScope::Universe)
         .ifa_index(index)

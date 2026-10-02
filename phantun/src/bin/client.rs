@@ -1,21 +1,21 @@
 use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::{Socket, Stack};
+use fake_tcp::tun::Tun;
+use fake_tcp::{Merge, Socket, Stack};
 use log::{debug, error, info};
-use phantun::fec::{self, Fec, FecConfig, SEND_HEADROOM};
-use phantun::forward::forward;
+use phantun::fec::{self, Fec, FecConfig, HEADROOM};
+use phantun::forward::{self, forward};
 use phantun::offload;
 use phantun::utils::{
-    assign_ipv6_address, connect_udp, new_udp_reuseport, raise_fd_limit, shutdown_signal,
+    assign_address, connect_udp, new_udp_reuseport, raise_fd_limit, shutdown_signal,
     udp_recv_pktinfo,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio_tun::TunBuilder;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -106,6 +106,7 @@ async fn main() -> io::Result<()> {
         )
         .args(fec::args())
         .args(offload::args())
+        .args(forward::args())
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -134,18 +135,19 @@ async fn main() -> io::Result<()> {
         .parse()
         .expect("bad peer address for Tun interface");
 
-    let (tun_local6, tun_peer6) = if matches.get_flag("ipv4_only") {
-        (None, None)
-    } else {
-        (
-            matches
-                .get_one::<String>("tun_local6")
-                .map(|v| v.parse().expect("bad local address for Tun interface")),
-            matches
-                .get_one::<String>("tun_peer6")
-                .map(|v| v.parse().expect("bad peer address for Tun interface")),
-        )
-    };
+    let (tun_local6, tun_peer6): (Option<Ipv6Addr>, Option<Ipv6Addr>) =
+        if matches.get_flag("ipv4_only") {
+            (None, None)
+        } else {
+            (
+                matches
+                    .get_one::<String>("tun_local6")
+                    .map(|v| v.parse().expect("bad local address for Tun interface")),
+                matches
+                    .get_one::<String>("tun_peer6")
+                    .map(|v| v.parse().expect("bad peer address for Tun interface")),
+            )
+        };
 
     let tun_name = matches.get_one::<String>("tun").unwrap();
     let handshake_packet: Option<Vec<u8>> = matches
@@ -161,20 +163,25 @@ async fn main() -> io::Result<()> {
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
-    let tun = TunBuilder::new()
-        .name(tun_name) // if name is empty, then it is set by kernel.
-        .up() // or set it up manually using `sudo ip link set <tun-name> up`.
-        .address(tun_local)
-        .destination(tun_peer)
-        .queues(num_cpus)
-        .build()
-        .unwrap();
+    let gso = forward::gso(&matches);
+    // if name is empty, then it is set by kernel.
+    let tun = Tun::create(tun_name, num_cpus, gso).unwrap();
+    assign_address(tun[0].name(), tun_local.into(), tun_peer.into());
 
     if remote_addr.is_ipv6() {
-        assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
+        assign_address(
+            tun[0].name(),
+            tun_local6.unwrap().into(),
+            tun_peer6.unwrap().into(),
+        );
     }
 
     info!("Created TUN device {}", tun[0].name());
+    if tun[0].gro() {
+        info!("Packets pass the Tun interface in batches");
+    } else if gso {
+        info!("Packets pass the Tun interface one by one, as the kernel does not support batches");
+    }
 
     let tun_peer_ip = match remote_addr {
         SocketAddr::V4(_) => IpAddr::V4(tun_peer),
@@ -193,22 +200,28 @@ async fn main() -> io::Result<()> {
         (Arc<Socket>, Option<Arc<Fec>>),
     >::new()));
 
-    let mut stack = Stack::new(tun, tun_peer, tun_peer6);
+    // a client with eBPF cannot know whether the server merges before it says so itself
+    let merge = if tun[0].gro() && offload.is_none() {
+        Merge::Always
+    } else {
+        Merge::Never
+    };
+    let mut stack = Stack::new(tun, tun_peer, tun_peer6, merge);
 
     let main_offload = offload.clone();
     let main_loop = tokio::spawn(async move {
         let offload = main_offload;
-        let mut buf_r = [0u8; SEND_HEADROOM + MAX_PACKET_LEN];
+        let mut buf_r = [0u8; HEADROOM + MAX_PACKET_LEN];
 
         loop {
             let (size, udp_remote_addr, udp_local_addr) =
-                udp_recv_pktinfo(&udp_sock, &mut buf_r[SEND_HEADROOM..]).await?;
+                udp_recv_pktinfo(&udp_sock, &mut buf_r[HEADROOM..]).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
             if let Some((sock, fec)) = connections.read().await.get(&udp_remote_addr) {
-                fec::send_datagram(sock, fec.as_deref(), &mut buf_r[..SEND_HEADROOM + size]).await;
+                fec::send_datagram(sock, fec.as_deref(), &mut buf_r[..HEADROOM + size]).await;
                 continue;
             }
 
@@ -232,7 +245,7 @@ async fn main() -> io::Result<()> {
             let fec = fec_config.map(|c| Arc::new(Fec::new(c, sock.to_string())));
 
             // send first packet
-            if fec::send_datagram(&sock, fec.as_deref(), &mut buf_r[..SEND_HEADROOM + size])
+            if fec::send_datagram(&sock, fec.as_deref(), &mut buf_r[..HEADROOM + size])
                 .await
                 .is_none()
             {
@@ -293,7 +306,7 @@ async fn main() -> io::Result<()> {
 
             let connections = connections.clone();
             tokio::spawn(async move {
-                forward(sock, udp_sock, udp_remote_addr, fec, offloaded).await;
+                forward(sock, udp_sock, udp_remote_addr, fec, offloaded, gso).await;
                 connections.write().await.remove(&udp_remote_addr);
                 debug!("removed fake TCP socket from connections table");
             });

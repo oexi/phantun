@@ -19,7 +19,7 @@ bytes = "1"
 pnet = "0"
 rand = { version = "0", features = ["small_rng"] }
 internet-checksum = "0"
-tokio-tun = "0"
+libc = "0.2"
 flume = "0"
 tokio = { workspace = true }
 log = { workspace = true }
