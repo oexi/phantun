@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 pub mod fec;
+pub mod forward;
 pub mod offload;
 pub mod utils;
 

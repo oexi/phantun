@@ -17,27 +17,14 @@ use nix::sys::socket::{
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
-/// A UDP socket bound to `local_addr` with SO_REUSEPORT. It fails like any socket would, e.g. when
-/// the process has as many file descriptors open as it may.
+/// A UDP socket bound to `local_addr` with SO_REUSEPORT, which receives the datagrams of new UDP
+/// peers. It fails like any socket would, e.g. when the process has as many file descriptors open
+/// as it may.
 pub fn new_udp_reuseport(local_addr: SocketAddr) -> io::Result<UdpSocket> {
-    let udp_sock = socket2::Socket::new(
-        if local_addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        },
-        socket2::Type::DGRAM,
-        None,
-    )?;
-    udp_sock.set_reuse_port(true)?;
-    raise_recv_buffer(&udp_sock);
-    // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
-    udp_sock.set_cloexec(true)?;
-    udp_sock.set_nonblocking(true)?;
+    let udp_sock = new_udp(local_addr, true)?;
 
     // enable IP_PKTINFO/IPV6_PKTINFO delivery so we know the destination address of incoming
     // packets
@@ -56,25 +43,49 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> io::Result<UdpSocket> {
     udp_sock.try_into()
 }
 
-/// `count` UDP sockets bound to `local_addr` with SO_REUSEPORT and connected to `remote_addr`, one
-/// for each worker of a connection
-pub async fn connect_udp_reuseport(
+/// The UDP socket of a connection, bound to `local_addr` and connected to `remote_addr`. With
+/// `reuseport`, it shares the port of `local_addr` with the socket from [`new_udp_reuseport`],
+/// which then no longer receives the datagrams of `remote_addr`.
+///
+/// A connection has a single one: the kernel only balances datagrams between the sockets of a
+/// port that are not connected, so only one of several connected to the same address would
+/// receive them.
+pub async fn connect_udp(
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
-    count: usize,
-) -> io::Result<Vec<Arc<UdpSocket>>> {
-    let mut socks = Vec::with_capacity(count);
-    for _ in 0..count {
-        let sock = new_udp_reuseport(local_addr)?;
-        sock.connect(remote_addr).await?;
-        socks.push(Arc::new(sock));
-    }
-    Ok(socks)
+    reuseport: bool,
+) -> io::Result<UdpSocket> {
+    let udp_sock = new_udp(local_addr, reuseport)?;
+    udp_sock.bind(&socket2::SockAddr::from(local_addr))?;
+    let udp_sock: std::net::UdpSocket = udp_sock.into();
+    let udp_sock: UdpSocket = udp_sock.try_into()?;
+    udp_sock.connect(remote_addr).await?;
+    Ok(udp_sock)
 }
 
-/// Raises the limit of open file descriptors to the most the process may have. Each connection
-/// takes as many UDP sockets as there are CPUs, so the usual limit of 1024 only allows a few dozen
-/// on hosts with many CPUs.
+/// A non-blocking UDP socket for `local_addr`, not bound yet
+fn new_udp(local_addr: SocketAddr, reuseport: bool) -> io::Result<socket2::Socket> {
+    let udp_sock = socket2::Socket::new(
+        if local_addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        },
+        socket2::Type::DGRAM,
+        None,
+    )?;
+    if reuseport {
+        udp_sock.set_reuse_port(true)?;
+    }
+    raise_recv_buffer(&udp_sock);
+    // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
+    udp_sock.set_cloexec(true)?;
+    udp_sock.set_nonblocking(true)?;
+    Ok(udp_sock)
+}
+
+/// Raises the limit of open file descriptors to the most the process may have, as each connection
+/// takes a UDP socket.
 pub fn raise_fd_limit() {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
 

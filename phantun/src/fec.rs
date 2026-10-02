@@ -29,7 +29,7 @@
 
 use clap::{Arg, ArgMatches, value_parser};
 use fake_tcp::Socket;
-use fake_tcp::packet::MAX_PACKET_LEN;
+use fake_tcp::packet::{MAX_HEADER_LEN, MAX_PACKET_LEN};
 use log::{info, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::cmp::Reverse;
@@ -44,8 +44,11 @@ use tokio::time;
 
 const TYPE_DATA: u8 = 0;
 const TYPE_PARITY: u8 = 1;
-/// Bytes reserved in front of every outgoing datagram buffer for the data shard header
+/// Length of the header of a data shard
 pub const HEADROOM: usize = 6;
+/// Bytes reserved in front of every outgoing datagram for the headers of its packet, see
+/// [`send_datagram`]
+pub const SEND_HEADROOM: usize = MAX_HEADER_LEN + HEADROOM;
 const PARITY_HEADER_LEN: usize = 8;
 const LEN_PREFIX: usize = 2;
 /// Extra bytes FEC adds on top of the largest datagram, which is the size of a parity shard header
@@ -1159,26 +1162,27 @@ impl Drop for Fec {
     }
 }
 
-/// Sends the datagram `buf[HEADROOM..]` to the peer, encoding it with FEC if enabled.
-/// The first `HEADROOM` bytes of `buf` are scratch space for the FEC header.
+/// Sends the datagram `buf[SEND_HEADROOM..]` to the peer, encoding it with FEC if enabled.
+/// The first `SEND_HEADROOM` bytes of `buf` are scratch space for the headers, which are written
+/// in front of the datagram rather than copying it.
 ///
 /// A return of `None` means `sock` must be closed.
 pub async fn send_datagram(sock: &Socket, fec: Option<&Fec>, buf: &mut [u8]) -> Option<()> {
     let Some(fec) = fec else {
-        return sock.send(&buf[HEADROOM..]).await;
+        return sock.send_in_place(buf, SEND_HEADROOM).await;
     };
 
     let now = Instant::now();
     let closed = {
         let mut encoder = fec.encoder.lock().unwrap();
-        let closed = encoder.push(buf, now);
+        let closed = encoder.push(&mut buf[MAX_HEADER_LEN..], now);
         if std::mem::take(&mut encoder.started_group) {
             fec.wake.notify_one();
         }
         closed
     };
 
-    sock.send(buf).await?;
+    sock.send_in_place(buf, MAX_HEADER_LEN).await?;
     if let Some(closed) = closed {
         for p in fec.schedule(closed.encode(), now) {
             sock.send(&p).await?;
