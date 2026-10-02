@@ -63,6 +63,10 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MPSC_BUFFER_LEN: usize = 128;
+/// Size of the buffers that the reader tasks read packets into, one after the other, so that a
+/// buffer only has to be allocated every few packets. The packets keep their buffer alive until
+/// they are all dropped.
+const READ_BUF_LEN: usize = 16 * 1024;
 // Also in phantun/src/bpf/offload.bpf.c
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 
@@ -240,22 +244,45 @@ impl Socket {
     pub async fn send(&self, payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
-                // Take the sequence number atomically, as other threads or an eBPF program may
-                // send at the same time
-                let seq = self
-                    .numbers()
-                    .seq
-                    .fetch_add(payload.len() as u32, Ordering::Relaxed);
-                let flags = if self.numbers().flags.load(Ordering::Relaxed) & FLAG_PSH != 0 {
-                    tcp::TcpFlags::PSH | tcp::TcpFlags::ACK
-                } else {
-                    tcp::TcpFlags::ACK
-                };
+                let (seq, flags) = self.take_seq(payload.len());
                 let buf = self.build_tcp_packet_with_seq(seq, flags, Some(payload));
                 self.tun.send(&buf).await.ok().and(Some(()))
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Sends the datagram `buf[offset..]` like [`Socket::send`], but writes the headers in front
+    /// of it, to the end of `buf[..offset]`, instead of copying it. `offset` has to be at least
+    /// [`MAX_HEADER_LEN`].
+    pub async fn send_in_place(&self, buf: &mut [u8], offset: usize) -> Option<()> {
+        match self.state {
+            State::Established => {
+                let (seq, flags) = self.take_seq(buf.len() - offset);
+                let numbers = self.numbers();
+                let ack = numbers.ack.load(Ordering::Relaxed);
+                numbers.last_ack.store(ack, Ordering::Relaxed);
+
+                let packet = &mut buf[offset - header_len(self.local_addr, flags)..];
+                write_tcp_headers(packet, self.local_addr, self.remote_addr, seq, ack, flags);
+                self.tun.send(packet).await.ok().and(Some(()))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Takes the sequence number for a data packet with `len` bytes of payload, and returns it with
+    /// the flags of the packet
+    fn take_seq(&self, len: usize) -> (u32, u8) {
+        // Take the sequence number atomically, as other threads or an eBPF program may send at the
+        // same time
+        let seq = self.numbers().seq.fetch_add(len as u32, Ordering::Relaxed);
+        let flags = if self.numbers().flags.load(Ordering::Relaxed) & FLAG_PSH != 0 {
+            tcp::TcpFlags::PSH | tcp::TcpFlags::ACK
+        } else {
+            tcp::TcpFlags::ACK
+        };
+        (seq, flags)
     }
 
     /// Attempt to receive a datagram from the other end.
@@ -266,41 +293,45 @@ impl Socket {
     /// A return of `None` means the TCP connection is broken
     /// and this socket must be closed.
     pub async fn recv(&self, buf: &mut [u8]) -> Option<usize> {
+        let payload = self.recv_bytes().await?;
+        buf[..payload.len()].copy_from_slice(&payload);
+        Some(payload.len())
+    }
+
+    /// Like [`Socket::recv`], but returns the datagram where it was received rather than copying
+    /// it
+    pub async fn recv_bytes(&self) -> Option<Bytes> {
         match self.state {
             State::Established => {
-                self.incoming.recv_async().await.ok().and_then(|raw_buf| {
-                    let (_v4_packet, tcp_packet) = parse_ip_packet(&raw_buf).unwrap();
+                let raw_buf = self.incoming.recv_async().await.ok()?;
+                let (_v4_packet, tcp_packet) = parse_ip_packet(&raw_buf).unwrap();
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
-                        info!("Connection {} reset by peer", self);
-                        return None;
+                if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
+                    info!("Connection {} reset by peer", self);
+                    return None;
+                }
+
+                let payload = tcp_packet.payload();
+
+                let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
+                let numbers = self.numbers();
+                let last_ask = numbers.last_ack.load(Ordering::Relaxed);
+                numbers.ack.store(new_ack, Ordering::Relaxed);
+                // only sent once the handshake is complete on the other end
+                if !payload.is_empty() && numbers.flags.load(Ordering::Relaxed) & FLAG_PSH == 0 {
+                    numbers.flags.fetch_or(FLAG_PSH, Ordering::Relaxed);
+                }
+
+                if new_ack.overflowing_sub(last_ask).0 > MAX_UNACKED_LEN {
+                    let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                    if let Err(e) = self.tun.try_send(&buf) {
+                        // This should not really happen as we have not sent anything for
+                        // quite some time...
+                        info!("Connection {} unable to send idling ACK back: {}", self, e)
                     }
+                }
 
-                    let payload = tcp_packet.payload();
-
-                    let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
-                    let numbers = self.numbers();
-                    let last_ask = numbers.last_ack.load(Ordering::Relaxed);
-                    numbers.ack.store(new_ack, Ordering::Relaxed);
-                    // only sent once the handshake is complete on the other end
-                    if !payload.is_empty() && numbers.flags.load(Ordering::Relaxed) & FLAG_PSH == 0
-                    {
-                        numbers.flags.fetch_or(FLAG_PSH, Ordering::Relaxed);
-                    }
-
-                    if new_ack.overflowing_sub(last_ask).0 > MAX_UNACKED_LEN {
-                        let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
-                        if let Err(e) = self.tun.try_send(&buf) {
-                            // This should not really happen as we have not sent anything for
-                            // quite some time...
-                            info!("Connection {} unable to send idling ACK back: {}", self, e)
-                        }
-                    }
-
-                    buf[..payload.len()].copy_from_slice(payload);
-
-                    Some(payload.len())
-                })
+                Some(raw_buf.slice_ref(payload))
             }
             _ => unreachable!(),
         }
@@ -564,15 +595,17 @@ impl Stack {
         mut tuples_purge: broadcast::Receiver<AddrTuple>,
     ) {
         let mut tuples: HashMap<AddrTuple, flume::Sender<Bytes>> = HashMap::new();
+        let mut read_buf = BytesMut::new();
 
         loop {
-            let mut buf = BytesMut::zeroed(MAX_PACKET_LEN);
+            if read_buf.len() < MAX_PACKET_LEN {
+                read_buf = BytesMut::zeroed(READ_BUF_LEN);
+            }
 
             tokio::select! {
-                size = tun.recv(&mut buf) => {
+                size = tun.recv(&mut read_buf[..MAX_PACKET_LEN]) => {
                     let size = size.unwrap();
-                    buf.truncate(size);
-                    let buf = buf.freeze();
+                    let buf = read_buf.split_to(size).freeze();
 
                     match parse_ip_packet(&buf) {
                         Some((ip_packet, tcp_packet)) => {

@@ -31,6 +31,20 @@ impl IPPacket<'_> {
     }
 }
 
+/// Room to leave in front of a payload for the IP and TCP headers of a data packet, which have no
+/// options, see [`write_tcp_headers`]
+pub const MAX_HEADER_LEN: usize = IPV6_HEADER_LEN + TCP_HEADER_LEN;
+
+/// The length of the IP and TCP headers of a packet from `local_addr` with `flags`
+pub fn header_len(local_addr: SocketAddr, flags: u8) -> usize {
+    let ip_header_len = match local_addr {
+        SocketAddr::V4(_) => IPV4_HEADER_LEN,
+        SocketAddr::V6(_) => IPV6_HEADER_LEN,
+    };
+    let wscale = (flags & tcp::TcpFlags::SYN) != 0;
+    ip_header_len + TCP_HEADER_LEN + if wscale { 4 } else { 0 } // nop + wscale
+}
+
 pub fn build_tcp_packet(
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
@@ -39,23 +53,38 @@ pub fn build_tcp_packet(
     flags: u8,
     payload: Option<&[u8]>,
 ) -> Bytes {
+    let header_len = header_len(local_addr, flags);
+    let payload = payload.unwrap_or_default();
+    let mut buf = BytesMut::zeroed(header_len + payload.len());
+    buf[header_len..].copy_from_slice(payload);
+    write_tcp_headers(&mut buf, local_addr, remote_addr, seq, ack, flags);
+    buf.freeze()
+}
+
+/// Writes the IP and TCP headers of a packet to the start of `buf`, which holds the whole packet:
+/// the headers are [`header_len`] bytes long and followed by the payload, which is left as it is.
+pub fn write_tcp_headers(
+    buf: &mut [u8],
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+) {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
     };
     let wscale = (flags & tcp::TcpFlags::SYN) != 0;
-    let tcp_header_len = TCP_HEADER_LEN + if wscale { 4 } else { 0 }; // nop + wscale
-    let tcp_total_len = tcp_header_len + payload.map_or(0, |payload| payload.len());
-    let total_len = ip_header_len + tcp_total_len;
-    let mut buf = BytesMut::zeroed(total_len);
-
-    let mut ip_buf = buf.split_to(ip_header_len);
-    let mut tcp_buf = buf.split_to(tcp_total_len);
-    assert_eq!(0, buf.len());
+    let total_len = buf.len();
+    let tcp_total_len = total_len - ip_header_len;
+    // the buffer may hold anything where the headers go
+    buf[..header_len(local_addr, flags)].fill(0);
+    let (ip_buf, tcp_buf) = buf.split_at_mut(ip_header_len);
 
     match (local_addr, remote_addr) {
         (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
-            let mut v4 = ipv4::MutableIpv4Packet::new(&mut ip_buf).unwrap();
+            let mut v4 = ipv4::MutableIpv4Packet::new(ip_buf).unwrap();
             v4.set_version(4);
             v4.set_header_length(IPV4_HEADER_LEN as u8 / 4);
             v4.set_next_level_protocol(ip::IpNextHeaderProtocols::Tcp);
@@ -69,7 +98,7 @@ pub fn build_tcp_packet(
             v4.set_checksum(u16::from_be_bytes(cksm.checksum()));
         }
         (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
-            let mut v6 = ipv6::MutableIpv6Packet::new(&mut ip_buf).unwrap();
+            let mut v6 = ipv6::MutableIpv6Packet::new(ip_buf).unwrap();
             v6.set_version(6);
             v6.set_payload_length(tcp_total_len.try_into().unwrap());
             v6.set_next_header(ip::IpNextHeaderProtocols::Tcp);
@@ -80,7 +109,7 @@ pub fn build_tcp_packet(
         _ => unreachable!(),
     };
 
-    let mut tcp = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
+    let mut tcp = tcp::MutableTcpPacket::new(tcp_buf).unwrap();
     tcp.set_window(0xffff);
     tcp.set_source(local_addr.port());
     tcp.set_destination(remote_addr.port());
@@ -91,10 +120,6 @@ pub fn build_tcp_packet(
     if wscale {
         let wscale = tcp::TcpOption::wscale(14);
         tcp.set_options(&[tcp::TcpOption::nop(), wscale]);
-    }
-
-    if let Some(payload) = payload {
-        tcp.set_payload(payload);
     }
 
     let mut cksm = Checksum::new();
@@ -122,9 +147,6 @@ pub fn build_tcp_packet(
 
     cksm.add_bytes(tcp.packet());
     tcp.set_checksum(u16::from_be_bytes(cksm.checksum()));
-
-    ip_buf.unsplit(tcp_buf);
-    ip_buf.freeze()
 }
 
 /// Parses a TCP packet, `None` if it is something else or malformed
@@ -183,6 +205,27 @@ mod tests {
         assert_eq!(tcp.get_sequence(), 123);
         assert_eq!(tcp.get_acknowledgement(), 456);
         assert_eq!(tcp.payload(), b"data");
+    }
+
+    #[test]
+    fn write_headers_in_place() {
+        for (local, remote) in [
+            ("192.168.201.2:4567", "10.0.0.1:40000"),
+            ("[fcc9::2]:4567", "[2001:db8::1]:40000"),
+        ] {
+            let local: SocketAddr = local.parse().unwrap();
+            let remote: SocketAddr = remote.parse().unwrap();
+            for flags in [tcp::TcpFlags::ACK, tcp::TcpFlags::PSH | tcp::TcpFlags::ACK] {
+                let packet = build_tcp_packet(local, remote, 123, 456, flags, Some(b"data"));
+
+                // whatever is in front of the payload is overwritten
+                let mut buf = [0xa5u8; MAX_HEADER_LEN + 4];
+                buf[MAX_HEADER_LEN..].copy_from_slice(b"data");
+                let start = MAX_HEADER_LEN - header_len(local, flags);
+                write_tcp_headers(&mut buf[start..], local, remote, 123, 456, flags);
+                assert_eq!(buf[start..], packet[..]);
+            }
+        }
     }
 
     #[test]

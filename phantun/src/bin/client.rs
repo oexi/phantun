@@ -2,7 +2,7 @@ use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
-use phantun::fec::{self, Fec, FecConfig, HEADROOM};
+use phantun::fec::{self, Fec, FecConfig, SEND_HEADROOM};
 use phantun::forward::forward;
 use phantun::offload;
 use phantun::utils::{
@@ -198,17 +198,17 @@ async fn main() -> io::Result<()> {
     let main_offload = offload.clone();
     let main_loop = tokio::spawn(async move {
         let offload = main_offload;
-        let mut buf_r = [0u8; MAX_PACKET_LEN];
+        let mut buf_r = [0u8; SEND_HEADROOM + MAX_PACKET_LEN];
 
         loop {
             let (size, udp_remote_addr, udp_local_addr) =
-                udp_recv_pktinfo(&udp_sock, &mut buf_r[HEADROOM..]).await?;
+                udp_recv_pktinfo(&udp_sock, &mut buf_r[SEND_HEADROOM..]).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
             if let Some((sock, fec)) = connections.read().await.get(&udp_remote_addr) {
-                fec::send_datagram(sock, fec.as_deref(), &mut buf_r[..HEADROOM + size]).await;
+                fec::send_datagram(sock, fec.as_deref(), &mut buf_r[..SEND_HEADROOM + size]).await;
                 continue;
             }
 
@@ -232,7 +232,7 @@ async fn main() -> io::Result<()> {
             let fec = fec_config.map(|c| Arc::new(Fec::new(c, sock.to_string())));
 
             // send first packet
-            if fec::send_datagram(&sock, fec.as_deref(), &mut buf_r[..HEADROOM + size])
+            if fec::send_datagram(&sock, fec.as_deref(), &mut buf_r[..SEND_HEADROOM + size])
                 .await
                 .is_none()
             {

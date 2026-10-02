@@ -1,7 +1,7 @@
 //! Forwards the datagrams of a connection between its UDP socket and its fake TCP connection
 
 use crate::UDP_TTL;
-use crate::fec::{self, Fec, HEADROOM};
+use crate::fec::{self, Fec, SEND_HEADROOM};
 use crate::offload;
 use fake_tcp::Socket;
 use fake_tcp::packet::MAX_PACKET_LEN;
@@ -96,11 +96,11 @@ async fn udp_to_tcp(
     active: Arc<AtomicBool>,
     quit: CancellationToken,
 ) {
-    let mut buf = [0u8; MAX_PACKET_LEN];
+    let mut buf = [0u8; SEND_HEADROOM + MAX_PACKET_LEN];
 
     loop {
         let size = tokio::select! {
-            res = udp_sock.recv(&mut buf[HEADROOM..]) => match res {
+            res = udp_sock.recv(&mut buf[SEND_HEADROOM..]) => match res {
                 Ok(size) => size,
                 // e.g. ECONNREFUSED when nothing listens on the other end yet
                 Err(e) => {
@@ -111,7 +111,7 @@ async fn udp_to_tcp(
             _ = quit.cancelled() => return,
         };
 
-        if fec::send_datagram(&sock, fec.as_deref(), &mut buf[..HEADROOM + size])
+        if fec::send_datagram(&sock, fec.as_deref(), &mut buf[..SEND_HEADROOM + size])
             .await
             .is_none()
         {
@@ -130,13 +130,12 @@ async fn tcp_to_udp(
     active: Arc<AtomicBool>,
     quit: CancellationToken,
 ) {
-    let mut buf = [0u8; MAX_PACKET_LEN];
     let mut recovered = Vec::new();
 
     loop {
-        let size = tokio::select! {
-            res = sock.recv(&mut buf) => match res {
-                Some(size) => size,
+        let datagram = tokio::select! {
+            res = sock.recv_bytes() => match res {
+                Some(datagram) => datagram,
                 None => {
                     quit.cancel();
                     return;
@@ -145,9 +144,9 @@ async fn tcp_to_udp(
             _ = quit.cancelled() => return,
         };
 
-        if size > 0
+        if !datagram.is_empty()
             && let Err(e) =
-                fec::forward_to_udp(&udp_sock, fec.as_deref(), &buf[..size], &mut recovered).await
+                fec::forward_to_udp(&udp_sock, fec.as_deref(), &datagram, &mut recovered).await
         {
             error!(
                 "Unable to send UDP packet to {}: {}, closing connection",
