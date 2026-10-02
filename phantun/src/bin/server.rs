@@ -1,38 +1,28 @@
 use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::Stack;
-use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
-use phantun::fec::{self, Fec, FecConfig, HEADROOM};
+use phantun::fec::{self, Fec, FecConfig};
+use phantun::forward::forward;
 use phantun::offload;
-use phantun::utils::{assign_ipv6_address, connect_udp_reuseport, raise_fd_limit, shutdown_signal};
+use phantun::utils::{assign_ipv6_address, connect_udp, raise_fd_limit, shutdown_signal};
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
-use tokio::time;
 use tokio_tun::TunBuilder;
-use tokio_util::sync::CancellationToken;
 
-use phantun::UDP_TTL;
-
-/// The UDP sockets of a new connection, one for each worker, connected to `remote_addr` from a
-/// free port, and the address the remote end sees their datagrams coming from
-async fn connect_udp(
-    remote_addr: SocketAddr,
-    count: usize,
-) -> io::Result<(Vec<Arc<UdpSocket>>, SocketAddr)> {
-    let local_addr = UdpSocket::bind(if remote_addr.is_ipv4() {
-        "0.0.0.0:0"
+/// The UDP socket of a new connection, connected to `remote_addr` from a free port, and the address
+/// the remote end sees its datagrams coming from
+async fn connect_udp_any(remote_addr: SocketAddr) -> io::Result<(UdpSocket, SocketAddr)> {
+    let local_addr: SocketAddr = if remote_addr.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
-        "[::]:0"
-    })
-    .await?
-    .local_addr()?;
-    let socks = connect_udp_reuseport(local_addr, remote_addr, count).await?;
-    let udp_local = socks[0].local_addr()?;
-    Ok((socks, udp_local))
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let sock = connect_udp(local_addr, remote_addr, false).await?;
+    let udp_local = sock.local_addr()?;
+    Ok((sock, udp_local))
 }
 
 #[tokio::main]
@@ -203,16 +193,13 @@ async fn main() -> io::Result<()> {
     let main_offload = offload.clone();
     let main_loop = tokio::spawn(async move {
         let offload = main_offload;
-        let mut buf_udp = [0u8; MAX_PACKET_LEN];
-        let mut buf_tcp = [0u8; MAX_PACKET_LEN];
-
         loop {
             let mut sock = stack.accept().await;
             info!("New connection: {}", sock);
 
             // Dropping the connection, e.g. when out of file descriptors, keeps the others
-            let (udp_socks, udp_local) = match connect_udp(remote_addr, num_cpus).await {
-                Ok(socks) => socks,
+            let (udp_sock, udp_local) = match connect_udp_any(remote_addr).await {
+                Ok((sock, udp_local)) => (Arc::new(sock), udp_local),
                 Err(e) => {
                     error!(
                         "Unable to connect UDP socket to {}: {}, closing connection",
@@ -234,95 +221,10 @@ async fn main() -> io::Result<()> {
                 debug!("Sent handshake packet to: {}", sock);
             }
 
-            let packet_received = Arc::new(Notify::new());
-            let quit = CancellationToken::new();
             let fec = fec_config.map(|c| Arc::new(Fec::new(c, sock.to_string())));
-            offload::start_connection(offloaded.as_ref(), &sock, fec.as_ref(), &udp_socks[0]);
+            offload::start_connection(offloaded.as_ref(), &sock, fec.as_ref(), &udp_sock);
 
-            if let Some(ref fec) = fec {
-                let sock = sock.clone();
-                let fec = fec.clone();
-                let quit = quit.clone();
-
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = fec.run_flusher(&sock) => quit.cancel(),
-                        _ = quit.cancelled() => {},
-                    }
-                });
-            }
-            for (i, udp_sock) in udp_socks.into_iter().enumerate() {
-                let sock = sock.clone();
-                let fec = fec.clone();
-                let quit = quit.clone();
-                let packet_received = packet_received.clone();
-
-                tokio::spawn(async move {
-                    let mut recovered = Vec::new();
-
-                    loop {
-                        tokio::select! {
-                            Ok(size) = udp_sock.recv(&mut buf_udp[HEADROOM..]) => {
-                                if fec::send_datagram(&sock, fec.as_deref(), &mut buf_udp[..HEADROOM + size]).await.is_none() {
-                                    quit.cancel();
-                                    return;
-                                }
-
-                                packet_received.notify_one();
-                            },
-                            res = sock.recv(&mut buf_tcp) => {
-                                match res {
-                                    Some(size) => {
-                                        if size > 0
-                                            && let Err(e) = fec::forward_to_udp(&udp_sock, fec.as_deref(), &buf_tcp[..size], &mut recovered).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", remote_addr, e);
-                                                quit.cancel();
-                                                return;
-                                            }
-                                    },
-                                    None => {
-                                        quit.cancel();
-                                        return;
-                                    },
-                                }
-
-                                packet_received.notify_one();
-                            },
-                            _ = quit.cancelled() => {
-                                debug!("worker {} terminated", i);
-                                return;
-                            },
-                        };
-                    }
-                });
-            }
-
-            tokio::spawn(async move {
-                // Packets converted by eBPF do not pass through here
-                let mut offloaded_packets = offloaded.as_ref().map_or(0, |c| c.packets());
-                loop {
-                    let read_timeout = time::sleep(UDP_TTL);
-                    let packet_received_fut = packet_received.notified();
-
-                    tokio::select! {
-                        _ = read_timeout => {
-                            if let Some(ref c) = offloaded {
-                                let packets = c.packets();
-                                if packets != offloaded_packets {
-                                    offloaded_packets = packets;
-                                    continue;
-                                }
-                            }
-                            info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
-
-                            quit.cancel();
-                            return;
-                        },
-                        _ = quit.cancelled() => return,
-                        _ = packet_received_fut => {},
-                    }
-                }
-            });
+            tokio::spawn(forward(sock, udp_sock, remote_addr, fec, offloaded));
         }
     });
 

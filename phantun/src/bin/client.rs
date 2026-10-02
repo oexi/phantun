@@ -3,9 +3,10 @@ use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
 use phantun::fec::{self, Fec, FecConfig, HEADROOM};
+use phantun::forward::forward;
 use phantun::offload;
 use phantun::utils::{
-    assign_ipv6_address, connect_udp_reuseport, new_udp_reuseport, raise_fd_limit, shutdown_signal,
+    assign_ipv6_address, connect_udp, new_udp_reuseport, raise_fd_limit, shutdown_signal,
     udp_recv_pktinfo,
 };
 use std::collections::HashMap;
@@ -13,12 +14,8 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
-use tokio::time;
+use tokio::sync::RwLock;
 use tokio_tun::TunBuilder;
-use tokio_util::sync::CancellationToken;
-
-use phantun::UDP_TTL;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -269,9 +266,8 @@ async fn main() -> io::Result<()> {
             };
 
             // Dropping the connection, e.g. when out of file descriptors, keeps the others
-            let udp_socks = match connect_udp_reuseport(bind_addr, udp_remote_addr, num_cpus).await
-            {
-                Ok(socks) => socks,
+            let udp_sock = match connect_udp(bind_addr, udp_remote_addr, true).await {
+                Ok(sock) => Arc::new(sock),
                 Err(e) => {
                     error!(
                         "Unable to connect UDP socket to {}: {}, closing connection",
@@ -284,7 +280,7 @@ async fn main() -> io::Result<()> {
             let offloaded =
                 offload::register(offload.as_ref(), &mut sock, bind_addr, udp_remote_addr);
             let sock = Arc::new(sock);
-            offload::start_connection(offloaded.as_ref(), &sock, fec.as_ref(), &udp_socks[0]);
+            offload::start_connection(offloaded.as_ref(), &sock, fec.as_ref(), &udp_sock);
 
             assert!(
                 connections
@@ -295,107 +291,11 @@ async fn main() -> io::Result<()> {
             );
             debug!("inserted fake TCP socket into connection table");
 
-            // spawn "fastpath" UDP socket and task, this will offload main task
-            // from forwarding UDP packets
-
-            let packet_received = Arc::new(Notify::new());
-            let quit = CancellationToken::new();
-
-            if let Some(ref fec) = fec {
-                let sock = sock.clone();
-                let fec = fec.clone();
-                let quit = quit.clone();
-
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = fec.run_flusher(&sock) => quit.cancel(),
-                        _ = quit.cancelled() => {},
-                    }
-                });
-            }
-
-            for (i, udp_sock) in udp_socks.into_iter().enumerate() {
-                let sock = sock.clone();
-                let fec = fec.clone();
-                let quit = quit.clone();
-                let packet_received = packet_received.clone();
-
-                tokio::spawn(async move {
-                    let mut buf_udp = [0u8; MAX_PACKET_LEN];
-                    let mut buf_tcp = [0u8; MAX_PACKET_LEN];
-                    let mut recovered = Vec::new();
-
-                    loop {
-                        tokio::select! {
-                            Ok(size) = udp_sock.recv(&mut buf_udp[HEADROOM..]) => {
-                                if fec::send_datagram(&sock, fec.as_deref(), &mut buf_udp[..HEADROOM + size]).await.is_none() {
-                                    debug!("removed fake TCP socket from connections table");
-                                    quit.cancel();
-                                    return;
-                                }
-
-                                packet_received.notify_one();
-                            },
-                            res = sock.recv(&mut buf_tcp) => {
-                                match res {
-                                    Some(size) => {
-                                        if size > 0
-                                            && let Err(e) = fec::forward_to_udp(&udp_sock, fec.as_deref(), &buf_tcp[..size], &mut recovered).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", udp_remote_addr, e);
-                                                quit.cancel();
-                                                return;
-                                            }
-                                    },
-                                    None => {
-                                        debug!("removed fake TCP socket from connections table");
-                                        quit.cancel();
-                                        return;
-                                    },
-                                }
-
-                                packet_received.notify_one();
-                            },
-                            _ = quit.cancelled() => {
-                                debug!("worker {} terminated", i);
-                                return;
-                            },
-                        };
-                    }
-                });
-            }
-
             let connections = connections.clone();
             tokio::spawn(async move {
-                // Packets converted by eBPF do not pass through here
-                let mut offloaded_packets = offloaded.as_ref().map_or(0, |c| c.packets());
-                loop {
-                    let read_timeout = time::sleep(UDP_TTL);
-                    let packet_received_fut = packet_received.notified();
-
-                    tokio::select! {
-                        _ = read_timeout => {
-                            if let Some(ref c) = offloaded {
-                                let packets = c.packets();
-                                if packets != offloaded_packets {
-                                    offloaded_packets = packets;
-                                    continue;
-                                }
-                            }
-                            info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
-                            connections.write().await.remove(&udp_remote_addr);
-                            debug!("removed fake TCP socket from connections table");
-
-                            quit.cancel();
-                            return;
-                        },
-                        _ = quit.cancelled() => {
-                            connections.write().await.remove(&udp_remote_addr);
-                            debug!("removed fake TCP socket from connections table");
-                            return;
-                        },
-                        _ = packet_received_fut => {},
-                    }
-                }
+                forward(sock, udp_sock, udp_remote_addr, fec, offloaded).await;
+                connections.write().await.remove(&udp_remote_addr);
+                debug!("removed fake TCP socket from connections table");
             });
         }
     });
