@@ -524,12 +524,15 @@ static __always_inline int load_record(struct __sk_buff *skb, __u32 off, struct 
 				       __u32 len)
 {
 	// clang would drop or merge these checks, as it knows the bounds already, but the verifier
-	// needs them on the register that is passed
-	asm volatile("" : "+r"(len));
-	if (len == 0)
-		return -1;
+	// needs them on the register that is passed. The upper bound comes first: the verifier only
+	// excludes 0 at an end of the range, and when `len` comes from a subtraction, its range may
+	// go around 0 until then, as on Linux 7.2, which tracks it as [-5, 1494] rather than as any
+	// 32-bit value.
 	asm volatile("" : "+r"(len));
 	if (len > sizeof(rec->data))
+		return -1;
+	asm volatile("" : "+r"(len));
+	if (len == 0)
 		return -1;
 	rec->len = len;
 	return bpf_skb_load_bytes(skb, off, rec->data, len);
