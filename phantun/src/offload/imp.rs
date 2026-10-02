@@ -135,6 +135,27 @@ fn last_os_error(what: &str) -> String {
     format!("{what}: {}", std::io::Error::last_os_error())
 }
 
+/// Loads the program `name` of `ebpf`, and returns its file descriptor
+fn load_program(ebpf: &mut Ebpf, name: &str) -> Result<i32, String> {
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(name)
+        .unwrap()
+        .try_into()
+        .map_err(|e| format!("{name}: {e}"))?;
+    prog.load().map_err(|e| match e {
+        // The verifier log is long, only show it when asked for
+        aya::programs::ProgramError::LoadError {
+            io_error,
+            verifier_log,
+        } => {
+            debug!("verifier log of {name}:\n{verifier_log}");
+            format!("the kernel rejected the eBPF program {name}: {io_error}")
+        }
+        e => format!("unable to load the eBPF program {name}: {e}"),
+    })?;
+    Ok(prog.fd().unwrap().as_fd().as_raw_fd())
+}
+
 fn if_index(name: &str) -> Option<u32> {
     nix::net::if_::if_nametoindex(name).ok()
 }
@@ -188,8 +209,11 @@ impl Drop for States {
 unsafe impl Send for States {}
 unsafe impl Sync for States {}
 
-/// The programs attached to network interfaces
+/// The programs that convert on network interfaces
 struct NicPrograms {
+    /// For the ingress of the Tun interface, sends Phantun's own packets out of the network
+    /// interface
+    tun_ingress: i32,
     /// For interfaces with an Ethernet header
     ingress_eth: i32,
     /// For interfaces without one
@@ -205,8 +229,9 @@ pub struct Offload {
     free_slots: Mutex<Vec<u32>>,
     tun: String,
     tun_ifindex: u32,
-    /// Unless the conversion on network interfaces is disabled
-    nic_programs: Option<NicPrograms>,
+    /// Unless the conversion on network interfaces is disabled, or its programs cannot be
+    /// loaded, why
+    nic_programs: Result<NicPrograms, String>,
     /// The filters on the loopback and network interfaces, the ones on the Tun interface go with
     /// it. The network interfaces get theirs once a connection uses them, by index.
     filters: Mutex<HashMap<u32, Vec<FilterId>>>,
@@ -249,43 +274,28 @@ impl Offload {
             .load(OBJECT)
             .map_err(|e| format!("unable to load the eBPF programs: {e}"))?;
 
-        let mut fds = Vec::new();
-        for name in [
-            "tcp_to_udp",
-            "udp_to_tcp",
-            "redirect",
-            "tun_ingress",
-            "nic_ingress_eth",
-            "nic_ingress_l3",
-        ] {
-            let prog: &mut SchedClassifier = ebpf
-                .program_mut(name)
-                .unwrap()
-                .try_into()
-                .map_err(|e| format!("{name}: {e}"))?;
-            prog.load().map_err(|e| match e {
-                // The verifier log is long, only show it when asked for
-                aya::programs::ProgramError::LoadError {
-                    io_error,
-                    verifier_log,
-                } => {
-                    debug!("verifier log of {name}:\n{verifier_log}");
-                    format!("the kernel rejected the eBPF program {name}: {io_error}")
-                }
-                e => format!("unable to load the eBPF program {name}: {e}"),
-            })?;
-            fds.push(prog.fd().unwrap().as_fd().as_raw_fd());
-        }
-        let [
-            tcp_to_udp,
-            udp_to_tcp,
-            redirect,
-            tun_ingress,
-            nic_ingress_eth,
-            nic_ingress_l3,
-        ] = fds[..]
-        else {
-            unreachable!()
+        let tcp_to_udp = load_program(&mut ebpf, "tcp_to_udp")?;
+        let udp_to_tcp = load_program(&mut ebpf, "udp_to_tcp")?;
+        let redirect = load_program(&mut ebpf, "redirect")?;
+        // Without the programs for network interfaces, the packets are still converted on the Tun
+        // interface
+        let nic_programs = if nic {
+            let mut load = || -> Result<NicPrograms, String> {
+                Ok(NicPrograms {
+                    tun_ingress: load_program(&mut ebpf, "tun_ingress")?,
+                    ingress_eth: load_program(&mut ebpf, "nic_ingress_eth")?,
+                    ingress_l3: load_program(&mut ebpf, "nic_ingress_l3")?,
+                    redirect,
+                })
+            };
+            load().inspect_err(|e| {
+                info!(
+                    "eBPF data path unavailable on network interfaces, packets are converted on \
+                     the Tun interface: {e}"
+                )
+            })
+        } else {
+            Err("disabled by --no-ebpf-nic".to_string())
         };
 
         let take_hash_map = |ebpf: &mut Ebpf, name| {
@@ -309,11 +319,7 @@ impl Offload {
             free_slots: Mutex::new((0..MAX_CONNECTIONS).rev().collect()),
             tun: tun.to_string(),
             tun_ifindex,
-            nic_programs: nic.then_some(NicPrograms {
-                ingress_eth: nic_ingress_eth,
-                ingress_l3: nic_ingress_l3,
-                redirect,
-            }),
+            nic_programs,
             filters: Mutex::new(HashMap::new()),
             ipv4_unavailable: None,
             records: Mutex::new(Some(records)),
@@ -322,8 +328,8 @@ impl Offload {
             _ebpf: ebpf,
         };
         // On failure, dropping `offload` removes the filters attached so far
-        offload.attach(tcp_to_udp, udp_to_tcp, redirect, tun_ingress)?;
-        if nic {
+        offload.attach(tcp_to_udp, udp_to_tcp, redirect)?;
+        if offload.nic_programs.is_ok() {
             offload.prepare_nics(remote);
         }
 
@@ -338,13 +344,7 @@ impl Offload {
         format!("{FILTER_NAME_PREFIX}{}", self.tun)
     }
 
-    fn attach(
-        &self,
-        tcp_to_udp: i32,
-        udp_to_tcp: i32,
-        redirect: i32,
-        tun_ingress: i32,
-    ) -> Result<(), String> {
+    fn attach(&self, tcp_to_udp: i32, udp_to_tcp: i32, redirect: i32) -> Result<(), String> {
         let mut nl = Netlink::new().map_err(|e| format!("netlink: {e}"))?;
         let name = self.filter_name();
         let tun_ifindex = self.tun_ifindex;
@@ -389,10 +389,10 @@ impl Offload {
                 None,
             ),
         ];
-        if self.nic_programs.is_some() {
+        if let Ok(ref programs) = self.nic_programs {
             filters.push((
                 filter(tun_ifindex, Direction::Ingress, 1, 1),
-                tun_ingress,
+                programs.tun_ingress,
                 None,
             ));
         }
@@ -588,8 +588,8 @@ impl Offload {
         let to_tcp = Tuple::new(tcp_local, tcp_remote).ok_or_else(mismatch)?;
 
         let nic = match self.nic_programs {
-            None => Err("disabled by --no-ebpf-nic".to_string()),
-            Some(_) => self.nic_path(tcp_local, tcp_remote),
+            Err(ref e) => Err(e.clone()),
+            Ok(_) => self.nic_path(tcp_local, tcp_remote),
         };
 
         let slot = self
