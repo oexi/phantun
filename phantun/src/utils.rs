@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, info};
 use neli::{
     consts::{
         nl::NlmF,
@@ -100,26 +100,42 @@ pub fn raise_fd_limit() {
 }
 
 /// The receive buffer size of the UDP sockets. Applications such as kernel WireGuard send
-/// datagrams in bursts, which overflow the default buffer of about 200 KiB before Phantun gets to
-/// read them. The losses this causes make TCP inside the tunnel retransmit a lot and slow down.
-/// A larger buffer only queues more while Phantun cannot keep up, which adds up to about 15 ms of
-/// latency at 500 Mbit/s.
-const UDP_RECV_BUFFER: usize = 1024 * 1024;
+/// datagrams in bursts, which overflow smaller buffers before Phantun gets to read them, even with
+/// spare CPU. The losses this causes make TCP inside the tunnel retransmit a lot and slow down.
+/// Between two network namespaces, with WireGuard over Phantun at 1.5 Gbit/s, 1 MiB still lost
+/// thousands of datagrams per second, and 2 MiB some with 20 ms RTT when Phantun was short of CPU,
+/// 4 MiB none. Latency under load did not grow beyond 2 MiB, also when Phantun was short of CPU,
+/// and the memory is only taken while datagrams wait.
+const UDP_RECV_BUFFER: usize = 4 * 1024 * 1024;
 
 /// Raises the receive buffer of `sock` to `UDP_RECV_BUFFER`, beyond net.core.rmem_max if
-/// permitted, which CAP_NET_ADMIN does
+/// permitted, which CAP_NET_ADMIN does. Logs once if it remains smaller.
 fn raise_recv_buffer(sock: &socket2::Socket) {
     use nix::sys::socket::{setsockopt, sockopt};
+    use std::sync::Once;
+    static LIMITED: Once = Once::new();
 
     // the kernel doubles the requested size to account for its overhead
-    if sock
-        .recv_buffer_size()
-        .is_ok_and(|size| size >= 2 * UDP_RECV_BUFFER)
-    {
+    let raised = || {
+        sock.recv_buffer_size()
+            .is_ok_and(|size| size >= 2 * UDP_RECV_BUFFER)
+    };
+    if raised() {
         return;
     }
     if setsockopt(sock, sockopt::RcvBufForce, &UDP_RECV_BUFFER).is_err() {
         let _ = setsockopt(sock, sockopt::RcvBuf, &UDP_RECV_BUFFER);
+    }
+    if !raised() {
+        LIMITED.call_once(|| {
+            info!(
+                "The receive buffer of the UDP sockets is limited to {} KiB, which may lose \
+                 datagrams under load: give Phantun CAP_NET_ADMIN, or set net.core.rmem_max to \
+                 {} or more",
+                sock.recv_buffer_size().unwrap_or(0) / 2 / 1024,
+                UDP_RECV_BUFFER
+            )
+        });
     }
 }
 
