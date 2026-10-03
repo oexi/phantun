@@ -786,6 +786,13 @@ impl Stack {
     /// Connects to the remote end. `None` returned means
     /// the connection attempt failed.
     pub async fn connect(&mut self, addr: SocketAddr) -> Option<Socket> {
+        self.connect_merging(addr, self.shared.merge == Merge::Always)
+            .await
+    }
+
+    /// Like [`Stack::connect`], but `merges` says whether the other end is told that this end
+    /// takes packets merged by GRO, rather than the `merge` of [`Stack::new`]
+    pub async fn connect_merging(&mut self, addr: SocketAddr, merges: bool) -> Option<Socket> {
         let mut rng = SmallRng::from_os_rng();
         for local_port in rng.random_range(32768..=60999)..=60999 {
             let local_addr = SocketAddr::new(
@@ -817,7 +824,7 @@ impl Stack {
                     addr,
                     None,
                     // the server has not said anything yet
-                    self.shared.merge == Merge::Always,
+                    merges,
                     false,
                 );
 

@@ -3,12 +3,12 @@
 //!
 //! It is used when available: the kernel has to support the programs and Phantun needs the
 //! privileges to load them (CAP_BPF and CAP_NET_ADMIN, or root). Otherwise, or with --no-ebpf,
-//! every packet goes through Phantun as before, which is also the case for connections whose
-//! application is on another host, as the programs only deliver datagrams locally.
+//! every packet goes through Phantun as before.
 //!
 //! The packets are converted on the network interface the fake TCP connection uses, bypassing the
-//! Tun interface, routing and netfilter, unless that is not possible or disabled with
-//! --no-ebpf-nic, in which case they are converted on the Tun interface.
+//! Tun interface, routing and netfilter. Connections for which that is not possible, e.g. those
+//! whose application is on another host, as the programs only deliver datagrams locally, pass
+//! through Phantun, which passes their packets to the kernel in batches.
 //!
 //! With FEC, the programs convert data shards and pass a copy of them to Phantun, which computes
 //! the parity shards and recovers lost data shards.
@@ -19,27 +19,18 @@ use fake_tcp::Socket;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-pub fn args() -> [Arg; 2] {
-    [
-        Arg::new("no_ebpf")
-            .long("no-ebpf")
-            .required(false)
-            .help(
-                "Do not convert packets in the kernel with eBPF. By default, the packets of a \
+pub fn args() -> [Arg; 1] {
+    [Arg::new("no_ebpf")
+        .long("no-ebpf")
+        .required(false)
+        .help(
+            "Do not convert packets in the kernel with eBPF. By default, the packets of a \
                  connection whose UDP peer is on this host are converted between UDP and fake \
-                 TCP by eBPF programs, when the kernel and permissions allow it",
-            )
-            .action(ArgAction::SetTrue),
-        Arg::new("no_ebpf_nic")
-            .long("no-ebpf-nic")
-            .required(false)
-            .help(
-                "Convert packets with eBPF on the Tun interface only. By default, they are \
-                 converted on the network interface the fake TCP connection uses, bypassing the \
-                 Tun interface, routing and netfilter",
-            )
-            .action(ArgAction::SetTrue),
-    ]
+                 TCP by eBPF programs on the network interface the connection uses, bypassing \
+                 the Tun interface, routing and netfilter, when the kernel and permissions allow \
+                 it",
+        )
+        .action(ArgAction::SetTrue)]
 }
 
 /// Sets up the eBPF data path for the Tun interface `tun`, unless it is disabled or not possible,
@@ -55,7 +46,7 @@ pub fn start(
         log::info!("eBPF data path disabled by --no-ebpf");
         return None;
     }
-    match Offload::new(tun, fec, !matches.get_flag("no_ebpf_nic"), remote) {
+    match Offload::new(tun, fec, remote) {
         Ok(offload) => {
             log::info!("eBPF data path enabled");
             let offload = Arc::new(offload);
@@ -67,6 +58,18 @@ pub fn start(
             None
         }
     }
+}
+
+/// Whether a connection from `tcp_local` to `tcp_remote` on the Tun interface for `udp_peer` is
+/// likely to be converted, before it is made. A client uses this to tell the server whether it takes
+/// packets merged by GRO, which it can only do for connections that pass through Phantun.
+pub fn may_convert(
+    offload: Option<&Arc<Offload>>,
+    udp_peer: SocketAddr,
+    tcp_local: IpAddr,
+    tcp_remote: IpAddr,
+) -> bool {
+    offload.is_some_and(|o| o.may_convert(udp_peer, tcp_local, tcp_remote).is_ok())
 }
 
 /// Prepares `sock` for conversion in the kernel, where `udp_local` is the address Phantun uses
@@ -108,14 +111,14 @@ pub fn start_connection(
             };
             if sock.merges() {
                 log::info!(
-                    "Packets sent on {sock} are converted by eBPF {}, those received pass through \
-                     Phantun, as the other end sends them merged{fec}",
-                    conn.location()
+                    "Packets sent on {sock} are converted by eBPF on {}, those received pass \
+                     through Phantun, as the other end sends them merged{fec}",
+                    conn.nic()
                 );
             } else {
                 log::info!(
-                    "Packets of {sock} are converted by eBPF {}{fec}",
-                    conn.location()
+                    "Packets of {sock} are converted by eBPF on {}{fec}",
+                    conn.nic()
                 );
             }
         }
@@ -144,10 +147,18 @@ mod imp {
         pub fn new(
             _tun: &str,
             _fec: bool,
-            _nic: bool,
             _remote: Option<(IpAddr, IpAddr)>,
         ) -> Result<Offload, String> {
             Err("Phantun was built without eBPF support".to_string())
+        }
+
+        pub fn may_convert(
+            &self,
+            _udp_peer: SocketAddr,
+            _tcp_local: IpAddr,
+            _tcp_remote: IpAddr,
+        ) -> Result<(), String> {
+            match *self {}
         }
 
         pub fn start_records(self: &Arc<Self>) {
@@ -179,7 +190,7 @@ mod imp {
             match *self {}
         }
 
-        pub fn location(&self) -> String {
+        pub fn nic(&self) -> &str {
             match *self {}
         }
 

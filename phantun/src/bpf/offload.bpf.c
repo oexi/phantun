@@ -5,10 +5,9 @@
 // Phantun normally moves every packet through user space: fake TCP packets are read from the Tun
 // interface and their payload is sent from a UDP socket, and datagrams received on that socket are
 // written to the Tun interface as fake TCP packets. Once user space has registered a connection in
-// the maps below, these programs do the same conversion inside the kernel, in one of two ways.
-//
-// Like mimic, on the network interface the fake TCP packets of the connection use, which leaves
-// out the Tun interface, routing and netfilter:
+// the maps below, these programs do the same conversion inside the kernel, like mimic, on the
+// network interface the fake TCP packets of the connection use, which leaves out the Tun
+// interface, routing and netfilter:
 //
 // - nic_ingress_eth and nic_ingress_l3, on ingress of the network interface (with an Ethernet
 //   header or without one), turn fake TCP packets from the other end into the UDP datagrams
@@ -22,12 +21,9 @@
 //   writes itself, such as ACKs, RSTs and FEC parity shards.
 //
 // User space finds the addresses after NAT in conntrack. Where the network interface cannot be
-// used, the conversion happens on the Tun interface, and the kernel routes and NATs the packets:
-//
-// - tcp_to_udp, on egress of the Tun interface, turns fake TCP packets that the kernel is about to
-//   hand to Phantun into the UDP datagrams Phantun would have sent, and
-// - udp_to_tcp turns datagrams into the fake TCP packets that enter the Tun interface as if
-//   Phantun had written them.
+// used, the connection is not registered, and all its packets pass through Phantun, which passes
+// them to the kernel in batches. That is faster than converting them one by one on the Tun
+// interface, where the kernel would still have to route and NAT each of them.
 //
 // The IP version may differ between both sides, e.g. fake TCP over IPv6 for an application on
 // 127.0.0.1.
@@ -36,15 +32,15 @@
 // filter's csum action, which computes the checksums in software and clears CHECKSUM_PARTIAL (eBPF
 // cannot move the offloaded checksum from the UDP to the TCP header), and is then redirected by the
 // `redirect` program of a later filter: to loopback ingress, so the datagram is received like one
-// sent by Phantun, to Tun ingress, so the packet is routed like one written by Phantun, or out of
-// the network interface, with the Ethernet header from the neighbour table.
+// sent by Phantun, to Tun egress, so that Phantun reads the packet, or out of the network
+// interface, with the Ethernet header from the neighbour table.
 //
 // Anything else, such as handshakes, RSTs, GRO/GSO packets, IP options or fragments, is left
 // alone and keeps taking the user space path. The sequence numbers live in an array that user
 // space maps into memory, so both paths share them.
 //
 // With FEC, udp_to_tcp also prepends the FEC header of a data shard, taking the group and index
-// from the same shared memory as user space, and tcp_to_udp removes it. Both pass a copy of the
+// from the same shared memory as user space, and nic_ingress_* remove it. Both pass a copy of the
 // datagram to user space through the `records` ring buffer, so that it can compute the parity
 // shards of the groups sent, and recover lost data shards of the groups received. Parity shards
 // received are only passed on as records and then dropped, so that user space gets everything in
@@ -235,17 +231,15 @@ struct tuple {
 	__u32 family; // 4 or 6
 };
 
-// The fake TCP packets of the connection are on a network interface rather than the Tun interface
-#define CONV_NIC 1
 // The fake TCP packets received are all left to user space, as the other end may send them merged
 // by GRO, which cannot be converted, and they have to stay in order
-#define CONV_USER_RX 2
+#define CONV_USER_RX 1
 
 // What a matching packet is turned into
 struct conversion {
 	struct tuple out;
-	// For fake TCP packets on a network interface: their addresses on the Tun interface, for the
-	// packets passed to user space there
+	// For fake TCP packets: their addresses on the Tun interface, for the packets passed to user
+	// space there
 	struct tuple tun;
 	__u32 slot; // index into `states`
 	// Identifies the connection in records, when it uses FEC, otherwise 0
@@ -254,9 +248,8 @@ struct conversion {
 	__u32 fec_data_shards;
 	// CONV_*
 	__u32 flags;
-	// Where the packets go: for udp_conversions and tun_conversions the network interface with
-	// CONV_NIC and the Tun interface otherwise, for tcp_conversions with CONV_NIC the Tun
-	// interface, for the packets passed to user space
+	// Where the packets go: for udp_conversions and tun_conversions the network interface, for
+	// tcp_conversions the Tun interface, for the packets passed to user space
 	__u32 ifindex;
 	__u32 _pad;
 };
@@ -275,7 +268,7 @@ struct state {
 	// interface after splitting them again.
 	__u32 ip_id;
 	__u32 _pad1;
-	// Packets converted by udp_to_tcp and tcp_to_udp. They are only used to see whether there is
+	// Packets converted by udp_to_tcp and nic_ingress_*. They are only used to see whether there is
 	// any traffic and for statistics, so the increments do not need to be atomic.
 	__u64 tx;
 	__u64 rx;
@@ -316,10 +309,10 @@ struct record {
 
 #define MAX_CONNECTIONS 4096
 
-// Fake TCP packets that tcp_to_udp and nic_ingress_* turn into datagrams, by their addresses
+// Fake TCP packets that nic_ingress_* turn into datagrams, by their addresses on the wire
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 2 * MAX_CONNECTIONS);
+	__uint(max_entries, MAX_CONNECTIONS);
 	__type(key, struct tuple);
 	__type(value, struct conversion);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -679,19 +672,6 @@ static __always_inline int convert_tcp(struct __sk_buff *skb, struct headers *h,
 	return CLS_MATCH;
 }
 
-// Egress of the Tun interface, so the packet starts with the IP header
-SEC("classifier/tcp_to_udp")
-int tcp_to_udp(struct __sk_buff *skb)
-{
-	struct headers h = {};
-	struct tcphdr tcp;
-
-	struct conversion *c = lookup_tcp(skb, 0, &tcp_conversions, &h, &tcp);
-	if (!c)
-		return CLS_NO_MATCH;
-	return convert_tcp(skb, &h, &tcp, c, MARK_PUSH_ETH);
-}
-
 // Ingress of a network interface whose packets start at `l3_off`
 static __always_inline int nic_ingress(struct __sk_buff *skb, __u32 l3_off, __u32 mark_flags)
 {
@@ -699,7 +679,7 @@ static __always_inline int nic_ingress(struct __sk_buff *skb, __u32 l3_off, __u3
 	struct tcphdr tcp;
 
 	struct conversion *c = lookup_tcp(skb, l3_off, &tcp_conversions, &h, &tcp);
-	if (!c || !(c->flags & CONV_NIC))
+	if (!c)
 		return CLS_NO_MATCH;
 	int ret = convert_tcp(skb, &h, &tcp, c, mark_flags);
 	if (ret != CLS_NO_MATCH)
@@ -729,7 +709,8 @@ int nic_ingress_l3(struct __sk_buff *skb)
 	return nic_ingress(skb, 0, MARK_PUSH_ETH);
 }
 
-// Ingress of the loopback interface, so the packet starts with an Ethernet header
+// Ingress of the loopback interface, so the packet starts with an Ethernet header. Sends the fake
+// TCP packets out of the network interface.
 SEC("classifier/udp_to_tcp")
 int udp_to_tcp(struct __sk_buff *skb)
 {
@@ -749,7 +730,7 @@ int udp_to_tcp(struct __sk_buff *skb)
 
 	struct tuple out = c->out;
 	__u32 fec_id = c->fec_id, data_shards = c->fec_data_shards;
-	__u32 ifindex = c->ifindex, nic = c->flags & CONV_NIC;
+	__u32 ifindex = c->ifindex;
 	__u32 grow = HEADER_DIFF + (fec_id ? FEC_DATA_HEADER_LEN : 0);
 	__u32 payload_len = h.len - (h.l4_off - h.l3_off) - sizeof(udp);
 	if (bpf_ntohs(udp.len) != sizeof(udp) + payload_len)
@@ -761,7 +742,7 @@ int udp_to_tcp(struct __sk_buff *skb)
 	// The kernel would drop packets too large for the network interface without telling anyone,
 	// let user space send them, so that they are handled like before
 	__u32 mtu_len = tcp_len;
-	if (nic && bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0))
+	if (bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0))
 		return CLS_NO_MATCH;
 
 	__u32 slot = c->slot;
@@ -843,7 +824,7 @@ int udp_to_tcp(struct __sk_buff *skb)
 	}
 
 	s->tx++;
-	mark(skb, ifindex, nic ? MARK_NEIGH : 0);
+	mark(skb, ifindex, MARK_NEIGH);
 	return CLS_MATCH;
 }
 
@@ -858,7 +839,8 @@ static __always_inline int store_loopback_eth(struct __sk_buff *skb)
 }
 
 // Ingress of the Tun interface, direct action. Sends the fake TCP packets that Phantun writes for
-// connections on a network interface out of it, as udp_to_tcp does with those it converts.
+// registered connections out of their network interface, as udp_to_tcp does with those it
+// converts.
 SEC("classifier/tun_ingress")
 int tun_ingress(struct __sk_buff *skb)
 {

@@ -75,6 +75,8 @@ const ETH_P_ALL: u16 = 0x0003;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Ingress,
+    // Phantun only attaches filters for ingress
+    #[allow(dead_code)]
     Egress,
 }
 

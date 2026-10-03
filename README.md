@@ -407,19 +407,27 @@ inside the kernel, which no longer have to be copied to and from Phantun. This i
 automatically, nothing needs to be configured, and the packets on the wire are the same, so either
 end may use it regardless of what the other end does.
 
-In a test with WireGuard over Phantun between two network namespaces of a 4 core ARM VM, `iperf3`
-reached:
+In a test with WireGuard over Phantun between two network namespaces of a 4 core ARM VM, linked
+through a third one that added the delay and loss, `iperf3` reached, up / down (median of 3 runs):
 
-| Phantun                                       | No added delay | 20 ms RTT    | 20 ms RTT, 1% loss, FEC `10:2` |
-|-----------------------------------------------|----------------|--------------|--------------------------------|
-| Without eBPF (`--no-ebpf`)                    | 526 Mbit/s     | 474 Mbit/s   | 353 Mbit/s                     |
-| eBPF on the Tun interface (`--no-ebpf-nic`)   | 1.08 Gbit/s    | 1.05 Gbit/s  | 858 Mbit/s                     |
-| eBPF on the network interface (the default)   | 1.54 Gbit/s    | 1.07 Gbit/s  | 1.00 Gbit/s                    |
+| Phantun                       | No added delay     | 20 ms RTT           | 20 ms RTT, 1% loss each way, FEC `10:2` |
+|-------------------------------|--------------------|---------------------|-----------------------------------------|
+| Without eBPF (`--no-ebpf`)    | 1.51 / 1.50 Gbit/s | 1.03 / 1.02 Gbit/s  | 899 / 884 Mbit/s                        |
+| With eBPF (the default)       | 1.76 / 1.71 Gbit/s | 1.06 / 1.02 Gbit/s  | 936 / 937 Mbit/s                        |
 
-Without eBPF, TCP inside WireGuard retransmitted about 25000 segments in 10 seconds at 20 ms RTT,
-with eBPF almost none. With 20 ms RTT and no loss, something other than Phantun limits the
-throughput. These figures predate [packets in batches](#packets-in-batches-gso-and-gro), which
-make Phantun much faster without eBPF.
+The veth links split and merged packets like the drivers of real network interfaces, and passed
+the packets they received on to other cores (RPS), as the other host would. Without that, the
+whole way from the sending WireGuard to the receiving one runs on a single core with eBPF, which
+makes it look slower than it is. With no added delay, the VM spent 16.7 s of CPU time per GB
+without eBPF and 16.0 s with it. With 20 ms RTT and no loss, something other than Phantun limits
+the throughput. TCP inside WireGuard retransmitted nothing there, with or without eBPF; earlier
+versions reordered datagrams without eBPF, so it retransmitted about 25000 segments in 10 seconds.
+
+Earlier versions also converted packets on the Tun interface where the network interface could
+not be used (`--no-ebpf-nic`), which only reached 1.23 / 1.33 Gbit/s with no added delay, and took
+20.6 s of CPU time per GB: the converted packets pass the kernel's forwarding path one by one,
+while Phantun passes them [in batches](#packets-in-batches-gso-and-gro). Such connections now pass
+through Phantun instead.
 
 With [FEC](#forward-error-correction-fec), the programs convert data shards and pass a copy of
 them to Phantun, which computes the parity shards from them and recovers lost data shards, so only
@@ -458,13 +466,11 @@ and the addresses NAT gave the connection in conntrack, and attaches the program
 when the first connection uses it. Where this is not possible, the log says why, e.g.
 
 ```
-INFO  phantun::offload > Packets of (...) are converted by eBPF on the Tun interface tun0 (not on the network interface: ...)
+INFO  phantun::offload > Packets of (...) pass through Phantun: gre1 is of an unsupported type (778)
 ```
 
-and the packets are converted on the Tun interface instead, after routing and NAT, which is also
-what `--no-ebpf-nic` does, and what happens to all connections if the kernel rejects the programs
-for network interfaces, which is logged at startup. Those packets still pass through the kernel's forwarding path, which is
-slower, as the table above shows.
+and the packets of the connection pass through Phantun, in batches. If the kernel rejects the
+programs, which is logged at startup, this applies to all connections.
 
 Network interfaces with an Ethernet header are supported, and those without one (`ARPHRD_NONE`,
 PPP or raw IP), such as WireGuard. The program on the network interface looks up every TCP packet
@@ -531,17 +537,15 @@ startup whether the Tun interface allows it:
 INFO  server > Packets pass the Tun interface in batches
 ```
 
-In a test with WireGuard over Phantun between two network namespaces of a 4 core ARM VM, whose
-veth link split and merged packets like the drivers of real network interfaces, `iperf3` reached,
-up / down:
+In the [same test as above](#ebpf-data-path), with no added delay, `iperf3` reached, up / down:
 
 | Client / server                      | Packets one by one | Packets in batches | CPU time of the client per GB, one by one / in batches |
 |--------------------------------------|--------------------|--------------------|--------------------------------------------------------|
-| Both `--no-ebpf`                     | 551 / 553 Mbit/s   | 1.63 / 1.62 Gbit/s | 12.0 / 2.8 s up, 12.8 / 2.8 s down                     |
-| `--no-ebpf` / eBPF                   | 524 / 769 Mbit/s   | 1.73 / 2.00 Gbit/s | 17.0 / 2.9 s up, 11.1 / 2.4 s down                     |
-| Both `--no-ebpf`, FEC `10:2`         | 430 / 442 Mbit/s   | 1.23 / 1.18 Gbit/s | 16.8 / 5.0 s up, 15.9 / 4.0 s down                     |
-| `--no-ebpf` / eBPF, FEC `10:2`       | 369 / 601 Mbit/s   | 1.19 / 1.39 Gbit/s | 24.6 / 5.2 s up, 14.6 / 4.4 s down                     |
-| Both eBPF                            | 1.35 / 1.32 Gbit/s | 1.35 / 1.30 Gbit/s |                                                        |
+| Both `--no-ebpf`                     | 481 / 489 Mbit/s   | 1.54 / 1.56 Gbit/s | 13.1 / 3.4 s up, 15.2 / 3.0 s down                     |
+| `--no-ebpf` / eBPF                   | 562 / 735 Mbit/s   | 1.64 / 1.71 Gbit/s | 15.0 / 3.4 s up, 11.7 / 2.7 s down                     |
+| Both `--no-ebpf`, FEC `10:2`         | 404 / 400 Mbit/s   | 1.16 / 1.17 Gbit/s | 17.5 / 5.7 s up, 18.8 / 4.2 s down                     |
+| `--no-ebpf` / eBPF, FEC `10:2`       | 407 / 574 Mbit/s   | 1.16 / 1.18 Gbit/s | 21.1 / 5.8 s up, 14.8 / 5.3 s down                     |
+| Both eBPF                            | 1.81 / 1.70 Gbit/s | 1.80 / 1.61 Gbit/s |                                                        |
 
 The first column is the previous version, which passes every packet on its own.
 
@@ -562,10 +566,12 @@ handshake, each end says whether it takes merged packets, with the window of its
 number only moves on every 32 KB, and datagrams of the same length are written together. Otherwise,
 packets are sent as before.
 
-An end without eBPF takes merged packets. An end with eBPF does not, except a server whose client
-does: it then converts the packets it sends with eBPF, and passes those it receives through
+An end without eBPF takes merged packets, and so does a client with eBPF on connections that it
+finds it cannot convert before it connects, e.g. as their network interface is not supported. An
+end with eBPF does not otherwise, except a server whose client does: it then converts the packets it sends with eBPF, and passes those it receives through
 Phantun, so that the client, e.g. a router without eBPF, can send in batches. The client saves far
-more than the server spends, as the table above shows. The log says so for each connection:
+more than the server spends: in the test above, without FEC, the client spent 11.6 s less CPU time
+per GB up and 9.0 s less down, the server 2.1 s and 0.5 s more. The log says so for each connection:
 
 ```
 INFO  phantun::offload > Packets sent on (...) are converted by eBPF on eth0, those received pass through Phantun, as the other end sends them merged

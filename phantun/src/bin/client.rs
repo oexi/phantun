@@ -200,12 +200,8 @@ async fn main() -> io::Result<()> {
         (Arc<Socket>, Option<Arc<Fec>>),
     >::new()));
 
-    // a client with eBPF cannot know whether the server merges before it says so itself
-    let merge = if tun[0].gro() && offload.is_none() {
-        Merge::Always
-    } else {
-        Merge::Never
-    };
+    let gro = tun[0].gro();
+    let merge = if gro { Merge::Always } else { Merge::Never };
     let mut stack = Stack::new(tun, tun_peer, tun_peer6, merge);
 
     let main_offload = offload.clone();
@@ -226,7 +222,17 @@ async fn main() -> io::Result<()> {
             }
 
             info!("New UDP client from {}", udp_remote_addr);
-            let sock = stack.connect(remote_addr).await;
+            // The packets that eBPF converts have to arrive one by one. A client cannot know
+            // whether the server merges before it says so itself, so it only takes merged packets
+            // on connections that pass through Phantun.
+            let merges = gro
+                && !offload::may_convert(
+                    offload.as_ref(),
+                    udp_remote_addr,
+                    tun_peer_ip,
+                    remote_addr.ip(),
+                );
+            let sock = stack.connect_merging(remote_addr, merges).await;
             if sock.is_none() {
                 error!("Unable to connect to remote {}", remote_addr);
                 continue;
