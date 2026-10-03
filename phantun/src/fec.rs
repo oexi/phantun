@@ -183,9 +183,11 @@ struct Stats {
     received_parity: u64,
     /// Lost data shards recovered from parity shards
     recovered: u64,
-    /// Lost data shards that could not be recovered. Losses at the end of a group are only known
-    /// once a parity shard of the group was received.
+    /// Lost data shards that could not be recovered, only known once their group is forgotten.
+    /// Without parity shards, the number of data shards in a group is an estimate.
     lost: u64,
+    /// Groups of which nothing was received, whose data shards are counted in `lost`
+    lost_groups: u64,
     /// Parity shards that arrived after their group was forgotten
     late_parity: u64,
     /// Frames that are not FEC frames
@@ -202,6 +204,7 @@ impl Stats {
             received_parity: self.received_parity - earlier.received_parity,
             recovered: self.recovered - earlier.recovered,
             lost: self.lost - earlier.lost,
+            lost_groups: self.lost_groups - earlier.lost_groups,
             late_parity: self.late_parity - earlier.late_parity,
             invalid: self.invalid - earlier.invalid,
         }
@@ -225,6 +228,9 @@ impl fmt::Display for Stats {
             self.recovered,
             self.lost
         )?;
+        if self.lost_groups > 0 {
+            write!(f, ", {} groups lost entirely", self.lost_groups)?;
+        }
 
         let data = self.received_data + self.recovered + self.lost;
         if data > 0 {
@@ -713,21 +719,23 @@ impl Group {
         self.parity = Vec::new();
     }
 
-    /// Number of data shards that are missing for good once the group is forgotten
-    fn lost(&self) -> usize {
+    /// Number of data shards that are missing for good once the group is forgotten. Without
+    /// parity shards, its number of data shards is taken to be `usual`, the number in the last
+    /// group with parity shards, unless more of them arrived.
+    fn lost(&self, usual: usize) -> usize {
         if self.done {
             return 0;
         }
 
         let k = match self.params {
             Some((k, _)) => k,
-            // without parity shards, only the data shards before the last one received are known
             None => self
                 .data
                 .iter()
                 .map(|&(i, _)| i as usize + 1)
                 .max()
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .max(usual),
         };
         k.saturating_sub(self.data.len())
     }
@@ -743,6 +751,11 @@ struct Decoder {
     slots: Vec<Option<Group>>,
     /// Newest group seen, those `MAX_GROUPS` or more before it are forgotten
     newest: Option<u32>,
+    /// First group seen, or since the decoder started over. The peer numbers groups one after
+    /// the other from there, so any group that is missing once it is forgotten was lost entirely.
+    first: Option<u32>,
+    /// The number of data shards in the last group with parity shards
+    usual_data_shards: usize,
     /// `(group, index, shard)` of the last data shard too far from the recent groups to keep
     /// track of
     far: Option<(u32, u8, Vec<u8>)>,
@@ -758,6 +771,8 @@ impl Default for Decoder {
         Decoder {
             slots: std::iter::repeat_with(|| None).take(MAX_GROUPS).collect(),
             newest: None,
+            first: None,
+            usual_data_shards: 0,
             far: None,
             codecs: Codecs::default(),
             stats: Stats::default(),
@@ -770,7 +785,35 @@ impl Decoder {
     /// Stores `group` in `slot`, forgetting the group it held
     fn replace(&mut self, slot: usize, group: Option<Group>) {
         if let Some(forgotten) = std::mem::replace(&mut self.slots[slot], group) {
-            self.stats.lost += forgotten.lost() as u64;
+            self.stats.lost += forgotten.lost(self.usual_data_shards) as u64;
+        }
+    }
+
+    /// Moves the newest group on by `ahead` groups, forgetting as many. Those of which nothing
+    /// arrived are counted as lost entirely, with as many data shards as the last group with
+    /// parity shards.
+    fn advance(&mut self, ahead: u32) {
+        let (Some(newest), Some(first)) = (self.newest, self.first) else {
+            return;
+        };
+        for i in 1..=ahead.min(MAX_GROUPS as u32) {
+            let forgotten = newest.wrapping_add(i).wrapping_sub(MAX_GROUPS as u32);
+            let arrived = self.slots[forgotten as usize % MAX_GROUPS]
+                .as_ref()
+                .is_some_and(|g| g.id == forgotten);
+            if !arrived && (forgotten.wrapping_sub(first) as i32) >= 0 {
+                self.stats.lost_groups += 1;
+                self.stats.lost += self.usual_data_shards as u64;
+            }
+        }
+        self.newest = Some(newest.wrapping_add(ahead));
+    }
+
+    /// Forgets every group, counting what is still missing as lost, once nothing more arrives
+    fn forget_all(&mut self) {
+        self.advance(MAX_GROUPS as u32);
+        for slot in 0..MAX_GROUPS {
+            self.replace(slot, None);
         }
     }
 
@@ -793,11 +836,13 @@ impl Decoder {
     /// were already delivered.
     fn slot(&mut self, id: u32) -> Option<usize> {
         let newest = *self.newest.get_or_insert(id);
+        self.first.get_or_insert(id);
         if !near(newest, id) {
             return None;
         }
-        if (id.wrapping_sub(newest) as i32) > 0 {
-            self.newest = Some(id);
+        let ahead = id.wrapping_sub(newest) as i32;
+        if ahead > 0 {
+            self.advance(ahead as u32);
         }
 
         // the slot holds either this group, or one that is no longer recent
@@ -826,6 +871,12 @@ impl Decoder {
                     self.replace(slot, None);
                 }
                 self.newest = Some(id);
+                // what was lost in between is unknown, the peer may have started over
+                self.first = Some(if (id.wrapping_sub(far) as i32) < 0 {
+                    id
+                } else {
+                    far
+                });
                 // it was forwarded already, so it must not be recovered again
                 let slot = self.slot(far).unwrap();
                 let group = self.slots[slot].as_mut().unwrap();
@@ -888,6 +939,7 @@ impl Decoder {
                 }
 
                 group.params = Some((k, m));
+                self.usual_data_shards = k;
                 group.parity.push((index, parity.to_vec()));
                 self.stats.received_parity += 1;
                 (None, self.recovery(slot))
@@ -1150,6 +1202,7 @@ impl Fec {
 impl Drop for Fec {
     /// Logs the statistics of the whole connection once it is closed
     fn drop(&mut self) {
+        self.decoder.get_mut().unwrap().forget_all();
         let stats = self.stats();
         if !stats.is_empty() {
             info!("FEC stats of {} in total: {}", self.name, stats);
@@ -1627,6 +1680,50 @@ mod tests {
             ids,
             (MAX_GROUPS as u32 * 3..MAX_GROUPS as u32 * 4).collect::<Vec<_>>()
         );
+        // none were missing, nor those before the first one
+        assert_eq!(decoder.stats.lost_groups, 0);
+    }
+
+    #[test]
+    fn whole_groups_lost() {
+        let mut encoder = Encoder::new(config(10, 3));
+        let mut decoder = Decoder::default();
+
+        // the second and third of 6 groups are lost entirely, which is only known once they are
+        // forgotten
+        let (frames, _) = groups(&mut encoder, 6, 10);
+        let frames = frames
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !(13..39).contains(i));
+        decode(&mut decoder, frames.map(|(_, f)| f));
+        assert_eq!(decoder.stats.lost_groups, 0);
+
+        let (frames, _) = groups(&mut encoder, MAX_GROUPS, 10);
+        decode(&mut decoder, frames.iter());
+        // with as many data shards as the others
+        assert_eq!((decoder.stats.lost, decoder.stats.lost_groups), (20, 2));
+
+        // forgetting the others does not count them again
+        decoder.forget_all();
+        assert_eq!((decoder.stats.lost, decoder.stats.lost_groups), (20, 2));
+    }
+
+    #[test]
+    fn losses_counted_when_forgotten_at_the_end() {
+        let mut encoder = Encoder::new(config(10, 3));
+        let mut decoder = Decoder::default();
+
+        // the second of 3 groups is lost entirely, and 4 data shards of the third
+        let (frames, _) = groups(&mut encoder, 3, 10);
+        let lost: Vec<usize> = (13..30).collect();
+        let frames = frames.iter().enumerate().filter(|(i, _)| !lost.contains(i));
+        decode(&mut decoder, frames.map(|(_, f)| f));
+        assert_eq!((decoder.stats.lost, decoder.stats.lost_groups), (0, 0));
+
+        // once nothing more arrives, e.g. as the connection is closed
+        decoder.forget_all();
+        assert_eq!((decoder.stats.lost, decoder.stats.lost_groups), (4 + 10, 1));
     }
 
     /// Encodes `groups * k` datagrams, which make `groups` groups when `k` is the size of a full
@@ -1739,6 +1836,9 @@ mod tests {
         );
         assert_eq!(sorted(delivered), sorted(datagrams));
         assert_eq!(decoder.newest, Some(encoder.group().wrapping_sub(1)));
+        // the groups in between may never have been sent, e.g. if the peer started over
+        decoder.forget_all();
+        assert_eq!(decoder.stats.lost_groups, 0);
     }
 
     #[test]
@@ -1767,7 +1867,7 @@ mod tests {
 
         // 1: 3 data shards lost and recovered
         // 2: 4 data shards lost for good, which its parity shards tell
-        // 3: 3 data shards and all parity shards lost, of which 2 data shards are known
+        // 3: 3 data shards and all parity shards lost, taken to have 10 data shards like the others
         // 4: nothing lost, so the parity shards are not needed
         let (old, _) = groups(&mut encoder, 4, 10);
         let lost = [0, 1, 2, 13, 14, 15, 16, 26, 28, 35, 36, 37, 38];
@@ -1797,7 +1897,7 @@ mod tests {
                 received_data: 7 + 6 + 7 + 10 + 2,
                 received_parity: 3 + 3 + 3,
                 recovered: 3,
-                lost: 4 + 2,
+                lost: 4 + 3,
                 late_parity: 1,
                 invalid: 1,
                 ..Stats::default()
@@ -1814,6 +1914,7 @@ mod tests {
             received_parity: 297,
             recovered: 9,
             lost: 1,
+            lost_groups: 0,
             late_parity: 0,
             invalid: 2,
         };
@@ -1825,6 +1926,20 @@ mod tests {
         );
         assert_eq!(stats.since(&stats), Stats::default());
         assert!(stats.since(&stats).is_empty());
+
+        let stats = Stats {
+            received_data: 900,
+            recovered: 50,
+            lost: 150,
+            lost_groups: 10,
+            ..Stats::default()
+        };
+        assert_eq!(
+            stats.to_string(),
+            "sent 0 data + 0 parity packets, received 900 data + 0 parity packets, \
+             recovered 50 and lost 150 data packets, 10 groups lost entirely \
+             (18.18% loss before FEC, 13.636% after)"
+        );
     }
 
     #[test]

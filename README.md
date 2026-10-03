@@ -393,8 +393,13 @@ lost 3 data packets (3.27% loss before FEC, 0.012% after)
 The received and recovered packets are those sent by the peer, so the loss is the one of the
 direction towards this end, which the peer's `K:M` has to cope with. Raise `M` when packets are
 still lost after FEC, and lower it when the loss before FEC is well below what `K:M` is meant for.
-Lost packets at the end of a group are only noticed when a parity packet of that group arrives, so
-losses after FEC may be slightly undercounted.
+
+Losses are counted once 256 newer groups have arrived, so those of the last moments only show up in
+the statistics of the whole connection. Without any of its parity packets, nothing tells how many
+data packets a group had. It is then taken to have as many as the last group whose parity packets
+arrived, also when a burst of loss takes out every packet of a group, which shows as `N groups lost
+entirely`. If they show up often, larger groups or `--fec-interval` may help, see
+[Burst loss](#burst-loss).
 
 [Back to TOC](#table-of-contents)
 
