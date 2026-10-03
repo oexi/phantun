@@ -26,6 +26,7 @@ A lightweight and fast UDP to TCP obfuscator.
 * [MTU overhead](#mtu-overhead)
     * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
 * [Forward error correction (FEC)](#forward-error-correction-fec)
+    * [Choosing `K:M`](#choosing-km)
     * [Burst loss](#burst-loss)
     * [Statistics](#statistics)
 * [eBPF data path](#ebpf-data-path)
@@ -348,20 +349,52 @@ when traffic is too slow to fill groups within `--fec-timeout`.
 
 FEC must be enabled on **both** Client and Server, as it changes the payload format. `K:M` controls
 the parity sent by each end and may differ per direction, e.g. more parity on the direction with
-more loss. Bandwidth overhead is `M / K` when groups are filled, e.g.:
-
-| Link loss | Suggested `K:M` | Overhead |
-|-----------|-----------------|----------|
-| ~1%       | `20:2`          | 10%      |
-| ~5%       | `10:3`          | 30%      |
-| ~10%      | `10:5`          | 50%      |
-| ~20%      | `10:9`          | 90%      |
+more loss. Bandwidth overhead is `M / K` when groups are filled, see
+[Choosing `K:M`](#choosing-km) for suggestions.
 
 FEC adds a 6 byte header to data packets and parity packets are 10 bytes larger than the largest
 packet of their group, so remember to lower the [MTU](#mtu-calculation-for-wireguard) accordingly.
 
 If only one end has FEC enabled, the tunnel does not work, and the end with FEC enabled logs a
 warning once it has received a few packets that are not FEC frames.
+
+## Choosing `K:M`
+
+TCP inside the tunnel takes the packets still lost after FEC for congestion and slows down, so the
+fewer the better. In a test with one TCP connection (CUBIC) through WireGuard over Phantun, between
+network namespaces of a 4 core ARM VM, linked at 200 Mbit/s with 50 ms RTT and random loss each
+way, the fastest `K:M` was always the one with the least overhead that left about 1 in 100,000
+packets lost (`iperf3`, up and down alike):
+
+| Link loss | Suggested `K:M` | Overhead | Throughput | Former suggestion       |
+|-----------|-----------------|----------|------------|-------------------------|
+| ~1%       | `30:4`          | 13%      | 157 Mbit/s | `20:2`: 74 Mbit/s       |
+| ~2%       | `40:6`          | 15%      | 157 Mbit/s |                         |
+| ~3%       | `40:8`          | 20%      | 152 Mbit/s |                         |
+| ~5%       | `40:10`         | 25%      | 149 Mbit/s | `10:3`: 31 Mbit/s       |
+| ~10%      | `40:16`         | 40%      | 140 Mbit/s | `10:5`: 36 Mbit/s       |
+| ~20%      | `40:28`         | 70%      | 130 Mbit/s | `10:9`: 39 Mbit/s       |
+
+Without loss, TCP reached 178 Mbit/s without FEC, but only 2 Mbit/s with 1% loss. With 150 ms RTT,
+the same suggestions came out best, or tied.
+
+* Larger groups need less overhead: a group of 40 packets is much less likely to lose more than its
+  share than a group of 10. With 1% loss, `40:8` leaves 2 in 10 billion packets lost, `10:2`, with
+  the same overhead, 5 in 100,000, which TCP already felt (82 Mbit/s).
+* Choose `K:M` for the worst loss of the link, e.g. in the evening. With more loss than a `K:M` is
+  meant for, the packets lost after FEC quickly add up, tenfold or more with half as much loss again.
+  Adding a parity packet or two leaves room for that.
+* The sender of a TCP connection through the tunnel, e.g. a server on the Internet, decides how it
+  reacts to loss. BBR mostly ignores it: in the same test, BBR without FEC still reached 168 Mbit/s
+  with 1% loss and 140 Mbit/s with 5%, no less than with FEC, which only paid off from about 10%
+  (`20:8`: 138 Mbit/s, 118 Mbit/s without).
+* A lost packet is only recovered once its group is complete, or after `--fec-timeout` at the
+  latest, so larger groups only add latency when traffic is too slow to fill them quickly.
+* The parity packets take CPU time in proportion to `M`. On aarch64, Reed-Solomon coding uses SIMD
+  and this hardly matters: sending 200 Mbit/s of UDP on the same VM, `10:2`, `20:4` and `40:8` all
+  took 1.5 times the CPU time of Phantun without FEC. Other architectures, x86_64 included, have no
+  SIMD for it, and the cost grows with `M`: built without SIMD, `10:2` took 1.8 times, `40:8` 2.4
+  times and `40:30` 5.3 times as much.
 
 ## Burst loss
 
@@ -378,6 +411,10 @@ anymore. Leave it off on links with random loss, where it only delays recovery. 
 remembers the last 256 groups, so keep the interval well below the time it takes to send that many.
 Parity packets arriving later are counted as late in the [statistics](#statistics). Like `K:M`, it
 only applies to the parity sent by the end it is set on.
+
+Larger groups also ride out short bursts better. With 5% loss in bursts of 4 packets on average,
+`10:3` still lost about 3% of the packets, `40:16` about 0.4%, and 0.2% with `--fec-interval 10`.
+Against bursts of 20 packets, neither helped much.
 
 ## Statistics
 
