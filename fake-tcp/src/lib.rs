@@ -666,7 +666,7 @@ impl Socket {
                     self.numbers().seq.fetch_add(1, Ordering::Relaxed);
                     self.numbers()
                         .ack
-                        .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
+                        .store(tcp_packet.get_sequence().wrapping_add(1), Ordering::Relaxed);
                     if tcp_packet.get_window() == MERGE_WINDOW {
                         self.numbers().flags.fetch_or(FLAG_MERGE, Ordering::Relaxed);
                     }

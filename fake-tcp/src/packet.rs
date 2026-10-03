@@ -196,6 +196,19 @@ pub fn write_headers(buf: &mut [u8], h: Headers, payload_len: usize, payload: Op
     }
 }
 
+/// The length of the IP packet in `buf` whose header says it is `len` bytes long. Bytes after it,
+/// such as the padding of a short Ethernet frame, are not part of it. Neither the kernel nor the
+/// eBPF programs of Phantun pass such bytes on, this only keeps them out of the payload if anything
+/// ever does. A length of zero, as for packets merged beyond 64 KiB, or beyond `buf` is not
+/// trusted, and the packet is taken to fill `buf`.
+fn ip_len(len: usize, buf: &[u8]) -> usize {
+    if len == 0 || len > buf.len() {
+        buf.len()
+    } else {
+        len
+    }
+}
+
 /// Parses a TCP packet, `None` if it is something else or malformed
 pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {
     let version = buf.first()? >> 4;
@@ -210,7 +223,8 @@ pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)
         if header_len < IPV4_HEADER_LEN {
             return None;
         }
-        let tcp = tcp::TcpPacket::new(buf.get(header_len..)?)?;
+        let len = ip_len(v4.get_total_length() as usize, buf);
+        let tcp = tcp::TcpPacket::new(buf.get(header_len..len)?)?;
         Some((IPPacket::V4(v4), tcp))
     } else if version == 6 {
         let v6 = ipv6::Ipv6Packet::new(buf)?;
@@ -218,7 +232,11 @@ pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)
             return None;
         }
 
-        let tcp = tcp::TcpPacket::new(buf.get(IPV6_HEADER_LEN..)?)?;
+        let len = match v6.get_payload_length() {
+            0 => buf.len(),
+            payload_len => ip_len(IPV6_HEADER_LEN + payload_len as usize, buf),
+        };
+        let tcp = tcp::TcpPacket::new(buf.get(IPV6_HEADER_LEN..len)?)?;
         Some((IPPacket::V6(v6), tcp))
     } else {
         None
@@ -296,6 +314,35 @@ mod tests {
                 assert_eq!(cksm.checksum(), packet[check_off..check_off + 2]);
             }
         }
+    }
+
+    #[test]
+    fn parse_padded() {
+        for (local, remote) in [
+            ("192.168.201.2:4567", "10.0.0.1:40000"),
+            ("[fcc9::2]:4567", "[2001:db8::1]:40000"),
+        ] {
+            let local: SocketAddr = local.parse().unwrap();
+            let remote: SocketAddr = remote.parse().unwrap();
+            for payload in [&b""[..], b"abc"] {
+                let packet =
+                    build_tcp_packet(local, remote, 123, 456, tcp::TcpFlags::ACK, Some(payload));
+
+                // the padding of a short Ethernet frame is not part of the payload
+                let mut buf = packet.to_vec();
+                buf.resize(packet.len().max(60) + 6, 0);
+                let buf = Bytes::from(buf);
+                let (_, tcp) = parse_ip_packet(&buf).unwrap();
+                assert_eq!(tcp.payload(), payload);
+            }
+        }
+
+        // a header that cuts the TCP header short is malformed
+        let local = "192.168.201.2:4567".parse().unwrap();
+        let remote = "10.0.0.1:40000".parse().unwrap();
+        let mut buf = build_tcp_packet(local, remote, 123, 456, tcp::TcpFlags::ACK, None).to_vec();
+        buf[2..4].copy_from_slice(&30u16.to_be_bytes());
+        assert!(parse_ip_packet(&Bytes::from(buf)).is_none());
     }
 
     #[test]

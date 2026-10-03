@@ -9,8 +9,8 @@
 # Usage: sudo tests/ebpf.sh [directory with the server and client binaries, default target/debug]
 #
 # Needs root, iproute2, iptables, python3 and the netem qdisc. With wg (wireguard-tools), it also
-# tests a network interface without an Ethernet header, by running Phantun over WireGuard, and with
-# the ipip module, one that is not supported.
+# tests a network interface without an Ethernet header, by running Phantun over WireGuard, with
+# the ipip module, one that is not supported, and with clang, frames padded like on Ethernet.
 
 set -euo pipefail
 
@@ -207,6 +207,39 @@ converted() {
     | awk -v prog="$4" '/^filter / { f = $0 ~ " name " prog " " } f && /Sent/ { print $4; exit }'
 }
 
+# pad_frames: pads the frames sent over the veth link to the 60 bytes of the shortest Ethernet
+# frame, as Ethernet does, so that short IPv4 packets, such as pure ACKs, RSTs and those of small
+# datagrams, arrive with bytes after them. Needs clang.
+pad_frames() {
+  cat > "$WORK/pad.bpf.c" <<'EOF'
+struct __sk_buff {
+	unsigned int len;
+};
+static long (*bpf_skb_change_tail)(struct __sk_buff *skb, unsigned int len,
+				   unsigned long long flags) = (void *)38;
+
+__attribute__((section("tc"), used)) int pad(struct __sk_buff *skb)
+{
+	if (skb->len < 60)
+		bpf_skb_change_tail(skb, 60, 0);
+	return 0;
+}
+
+char _license[] __attribute__((section("license"), used)) = "GPL";
+EOF
+  "${CLANG:-clang}" -O2 -target bpf -c "$WORK/pad.bpf.c" -o "$WORK/pad.bpf.o" || return 1
+  for dev in "$NS_C phantun-tc" "$NS_S phantun-ts"; do
+    set -- $dev
+    ip netns exec "$1" tc qdisc add dev "$2" clsact 2> /dev/null || true
+    ip netns exec "$1" tc filter add dev "$2" egress bpf direct-action obj "$WORK/pad.bpf.o" sec tc || return 1
+  done
+}
+
+unpad_frames() {
+  ip netns exec $NS_C tc filter del dev phantun-tc egress
+  ip netns exec $NS_S tc filter del dev phantun-ts egress
+}
+
 # loss <percent>: makes the link lose packets in both directions, 0 for none
 loss() {
   ip netns exec $NS_C tc qdisc replace dev phantun-tc root netem loss "$1%"
@@ -216,7 +249,8 @@ loss() {
 # run <name> <server address> <echo address> <local address> <expect eBPF: nic|server|no|batches>
 #   [phantun args]: with `server`, only the server converts on the network interface, and only the
 #   packets it sends, as the client merges packets. With `batches`, neither converts, and both
-#   merge packets. SERVER_ARGS and CLIENT_ARGS are passed to one side only.
+#   merge packets. SERVER_ARGS and CLIENT_ARGS are passed to one side only. SIZE is the size of
+#   the datagrams, 1000 bytes by default.
 run() {
   local name=$1 server=$2 remote=$3 local=$4 expect=$5
   shift 5
@@ -231,7 +265,7 @@ run() {
   host=${host#[}
   host=${host%]}
   local ok
-  ok=$(ip netns exec $NS_C python3 "$WORK/echo.py" client "$host" "$port" $COUNT 1000)
+  ok=$(ip netns exec $NS_C python3 "$WORK/echo.py" client "$host" "$port" $COUNT "${SIZE:-1000}")
   local s_nic c_nic
   s_nic=$(converted $NS_S $NIC_S ingress $NIC_PROG || true)
   c_nic=$(converted $NS_C $NIC_C ingress $NIC_PROG || true)
@@ -461,6 +495,15 @@ run "FEC with 5% loss, IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic 
 run "FEC with 5% loss, --no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --fec 4:2 --no-ebpf
 CLIENT_ARGS=--no-ebpf run "FEC with 5% loss, client --no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 server --fec 4:2
 loss 0
+
+# Datagrams of 5 bytes, whose fake TCP packets are shorter than the shortest Ethernet frame, like
+# pure ACKs and RSTs. The programs have to take them all the same, without the padding.
+if pad_frames; then
+  SIZE=5 run "Short packets in padded frames" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic
+  unpad_frames
+else
+  echo "=== Short packets in padded frames: skipped, unable to pad the frames (needs clang)"
+fi
 
 if command -v wg > /dev/null && setup_wg 2> /dev/null; then
   NIC_C=phantun-wc NIC_S=phantun-ws NIC_PROG=nic_ingress_l3
