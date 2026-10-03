@@ -390,11 +390,12 @@ the same suggestions came out best, or tied.
   (`20:8`: 138 Mbit/s, 118 Mbit/s without).
 * A lost packet is only recovered once its group is complete, or after `--fec-timeout` at the
   latest, so larger groups only add latency when traffic is too slow to fill them quickly.
-* The parity packets take CPU time in proportion to `M`. On aarch64, Reed-Solomon coding uses SIMD
-  and this hardly matters: sending 200 Mbit/s of UDP on the same VM, `10:2`, `20:4` and `40:8` all
-  took 1.5 times the CPU time of Phantun without FEC. Other architectures, x86_64 included, have no
-  SIMD for it, and the cost grows with `M`: built without SIMD, `10:2` took 1.8 times, `40:8` 2.4
-  times and `40:30` 5.3 times as much.
+* The parity packets take CPU time in proportion to `M`. On aarch64 and x86_64, Reed-Solomon coding
+  uses SIMD and this hardly matters: sending 200 Mbit/s of UDP on the same VM, `10:2`, `20:4` and
+  `40:8` all took 1.5 times the CPU time of Phantun without FEC. On x86_64 this needs a CPU with
+  AVX2 (Intel Haswell, AMD Excavator or newer), FEC crashes Phantun on older ones. Other
+  architectures have no SIMD for it, and the cost grows with `M`: built without SIMD, `10:2` took
+  1.8 times, `40:8` 2.4 times and `40:30` 5.3 times as much.
 
 ## Burst loss
 

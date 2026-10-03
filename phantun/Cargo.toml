@@ -25,9 +25,9 @@ log = { workspace = true }
 reed-solomon-erasure = "6"
 rand = "0"
 
-# The SIMD code is only built for x86_64 and aarch64, and on x86_64 it requires AVX2, which older
-# CPUs lack
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# The SIMD code is only built for x86_64 and aarch64, and on x86_64 it requires AVX2 (Haswell or
+# newer), without which FEC crashes
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 
 # The eBPF data path, aya does not support 32-bit x86
