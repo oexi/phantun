@@ -187,13 +187,23 @@ async fn tcp_to_udp(
                 sender.flush(&udp_sock).await
             }
         };
-        if let Err(e) = res {
-            error!(
-                "Unable to send UDP packet to {}: {}, closing connection",
-                udp_peer, e
-            );
-            quit.cancel();
-            return;
+        match res {
+            Ok(()) => {}
+            // Nothing listens on the other end right now, e.g. while it restarts. Closing the
+            // connection would not help, the next one would get a new port that the UDP peer
+            // does not know.
+            Err(e) if udp::is_refused(&e) => {
+                debug!("Unable to send UDP packet to {}: {}", udp_peer, e);
+                continue;
+            }
+            Err(e) => {
+                error!(
+                    "Unable to send UDP packet to {}: {}, closing connection",
+                    udp_peer, e
+                );
+                quit.cancel();
+                return;
+            }
         }
         mark_active(&active);
     }
