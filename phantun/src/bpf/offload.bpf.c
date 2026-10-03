@@ -163,6 +163,7 @@ static long (*bpf_skb_store_bytes)(struct __sk_buff *skb, __u32 offset, const vo
 static long (*bpf_redirect)(__u32 ifindex, __u64 flags) = (void *)23;
 static long (*bpf_skb_change_proto)(struct __sk_buff *skb, __be16 proto, __u64 flags) = (void *)31;
 static long (*bpf_skb_load_bytes)(const void *skb, __u32 offset, void *to, __u32 len) = (void *)26;
+static long (*bpf_skb_change_tail)(struct __sk_buff *skb, __u32 len, __u64 flags) = (void *)38;
 static long (*bpf_skb_change_head)(struct __sk_buff *skb, __u32 len, __u64 flags) = (void *)43;
 static long (*bpf_skb_adjust_room)(struct __sk_buff *skb, __s32 len_diff, __u32 mode,
 				   __u64 flags) = (void *)50;
@@ -418,10 +419,21 @@ static __always_inline int parse_ip(struct __sk_buff *skb, __u32 off, struct hea
 	}
 	h->tuple.family = h->family;
 
-	// Trailing bytes after the IP packet would end up in the converted payload
-	if (h->len + off != skb->len)
+	// Ethernet pads short frames, such as those of pure ACKs and RSTs over IPv4, so there may be
+	// bytes after the IP packet, which `trim` removes
+	if (h->len + off > skb->len)
 		return -1;
 	return 0;
+}
+
+// Removes the bytes after the IP packet `h`, which would otherwise end up in the converted payload
+// or be passed to Phantun as payload. The IP layer would remove them as well.
+static __always_inline int trim(struct __sk_buff *skb, const struct headers *h)
+{
+	__u32 len = h->l3_off + h->len;
+	if (skb->len == len)
+		return 0;
+	return bpf_skb_change_tail(skb, len, 0);
 }
 
 // Parses a TCP packet at `off`, and looks up its conversion in `map`
@@ -430,7 +442,9 @@ static __always_inline struct conversion *lookup_tcp(struct __sk_buff *skb, __u3
 {
 	if (parse_ip(skb, off, h) || h->protocol != IPPROTO_TCP)
 		return 0;
-	if (bpf_skb_load_bytes(skb, h->l4_off, tcp, sizeof(*tcp)))
+	// The header has to be part of the IP packet, not of what follows it
+	if (h->len < h->l4_off - h->l3_off + sizeof(*tcp) ||
+	    bpf_skb_load_bytes(skb, h->l4_off, tcp, sizeof(*tcp)))
 		return 0;
 	h->tuple.sport = tcp->source;
 	h->tuple.dport = tcp->dest;
@@ -684,7 +698,7 @@ static __always_inline int nic_ingress(struct __sk_buff *skb, __u32 l3_off, __u3
 	struct tcphdr tcp;
 
 	struct conversion *c = lookup_tcp(skb, l3_off, &tcp_conversions, &h, &tcp);
-	if (!c)
+	if (!c || trim(skb, &h))
 		return CLS_NO_MATCH;
 	int ret = convert_tcp(skb, &h, &tcp, c, mark_flags);
 	if (ret != CLS_NO_MATCH)
@@ -724,7 +738,8 @@ int udp_to_tcp(struct __sk_buff *skb)
 
 	if (skb->gso_size || parse_ip(skb, ETH_HLEN, &h) || h.protocol != IPPROTO_UDP)
 		return CLS_NO_MATCH;
-	if (bpf_skb_load_bytes(skb, h.l4_off, &udp, sizeof(udp)))
+	if (h.len < h.l4_off - h.l3_off + sizeof(udp) ||
+	    bpf_skb_load_bytes(skb, h.l4_off, &udp, sizeof(udp)))
 		return CLS_NO_MATCH;
 	h.tuple.sport = udp.source;
 	h.tuple.dport = udp.dest;
@@ -747,7 +762,7 @@ int udp_to_tcp(struct __sk_buff *skb)
 	// The kernel would drop packets too large for the network interface without telling anyone,
 	// let user space send them, so that they are handled like before
 	__u32 mtu_len = tcp_len;
-	if (bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0))
+	if (bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0) || trim(skb, &h))
 		return CLS_NO_MATCH;
 
 	__u32 slot = c->slot;
@@ -858,7 +873,7 @@ int tun_ingress(struct __sk_buff *skb)
 	if (!c || c->out.family != h.family)
 		return TC_ACT_UNSPEC;
 	__u32 ifindex = c->ifindex, mtu_len = h.len;
-	if (bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0))
+	if (bpf_check_mtu(skb, ifindex, &mtu_len, 0, 0) || trim(skb, &h))
 		return TC_ACT_UNSPEC;
 	if (rewrite_tcp(skb, &h, &c->out) || bpf_skb_change_head(skb, ETH_HLEN, 0) ||
 	    store_loopback_eth(skb))
