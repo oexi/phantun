@@ -3,7 +3,7 @@
 //! (UDP GSO)
 
 use fake_tcp::packet::MAX_PACKET_LEN;
-use log::info;
+use log::{debug, info};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use std::io::{self, IoSlice};
 use std::os::fd::AsRawFd;
@@ -37,10 +37,14 @@ impl Receiver {
     /// Receives the datagrams that are queued on `sock`, waiting for one if there are none, and
     /// returns the buffers holding them, each with the headroom in front. Longer datagrams are cut
     /// short.
+    ///
+    /// An error of the socket, such as ECONNREFUSED after an ICMP message, is returned as soon as
+    /// it occurs. Otherwise, it would stay until the next datagram is received or sent, which may
+    /// be much later when eBPF converts the datagrams, and then fail that.
     pub async fn recv(&mut self, sock: &UdpSocket) -> io::Result<Vec<&mut [u8]>> {
         let slot_len = self.headroom + MAX_PACKET_LEN;
         let count = sock
-            .async_io(Interest::READABLE, || {
+            .async_io(Interest::READABLE | Interest::ERROR, || {
                 let mut iov: [libc::iovec; RECV_BATCH] = unsafe { std::mem::zeroed() };
                 let mut msgs: [libc::mmsghdr; RECV_BATCH] = unsafe { std::mem::zeroed() };
                 for (i, (iov, msg)) in iov.iter_mut().zip(msgs.iter_mut()).enumerate() {
@@ -117,6 +121,11 @@ impl Sender {
 
     /// Sends the datagrams in `payload` to the peer `sock` is connected to: each is
     /// `segment_len` bytes long, but the last, which may be shorter
+    ///
+    /// ECONNREFUSED is the error of an ICMP message the socket received for an earlier datagram,
+    /// e.g. while nothing listened on the other end, which the kernel returns instead of sending
+    /// the next one. The datagrams are then sent again, and only if that fails too is the error
+    /// returned.
     pub async fn send_segments(
         &mut self,
         sock: &UdpSocket,
@@ -124,22 +133,35 @@ impl Sender {
         segment_len: usize,
     ) -> io::Result<()> {
         let mut rest = payload;
+        let mut refused = false;
         while !rest.is_empty() {
-            if !self.gso || rest.len() <= segment_len {
-                let (datagram, tail) = rest.split_at(segment_len.min(rest.len()));
-                rest = tail;
-                sock.send(datagram).await?;
-                continue;
-            }
-
-            let max_len =
-                (MAX_SEGMENTS * segment_len).min(MAX_SEGMENTS_LEN / segment_len * segment_len);
-            let (segments, tail) = rest.split_at(max_len.min(rest.len()));
-            match send_gso(sock, segments, segment_len).await {
-                Ok(()) => rest = tail,
+            let gso = self.gso && rest.len() > segment_len;
+            let len = if gso {
+                (MAX_SEGMENTS * segment_len).min(MAX_SEGMENTS_LEN / segment_len * segment_len)
+            } else {
+                segment_len
+            };
+            let (datagrams, tail) = rest.split_at(len.min(rest.len()));
+            let result = if gso {
+                send_gso(sock, datagrams, segment_len).await
+            } else {
+                sock.send(datagrams).await.map(|_| ())
+            };
+            match result {
+                Ok(()) => {
+                    rest = tail;
+                    refused = false;
+                }
+                Err(e) if is_refused(&e) && !refused => {
+                    debug!(
+                        "Sending to {:?} again after an earlier datagram was refused",
+                        sock.peer_addr()
+                    );
+                    refused = true;
+                }
                 // e.g. EIO without checksum offloading, or EINVAL for datagrams that need to be
                 // fragmented
-                Err(e) if e.raw_os_error() != Some(libc::ECONNREFUSED) => {
+                Err(e) if gso && !is_refused(&e) => {
                     info!(
                         "Unable to send datagrams to {:?} at once, sending them one by one: {e}",
                         sock.peer_addr()
@@ -203,6 +225,11 @@ impl Sender {
     }
 }
 
+/// Whether `e` is ECONNREFUSED, see [`Sender::send_segments`]
+pub fn is_refused(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECONNREFUSED)
+}
+
 /// Sends the datagrams in `payload`, each `segment_len` bytes long but the last, with one system
 /// call
 async fn send_gso(sock: &UdpSocket, payload: &[u8], segment_len: usize) -> io::Result<()> {
@@ -224,6 +251,7 @@ async fn send_gso(sock: &UdpSocket, payload: &[u8], segment_len: usize) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn runs(sender: &Sender) -> Vec<(usize, usize, usize)> {
         sender
@@ -279,5 +307,58 @@ mod tests {
         assert_eq!(lens, [300, 300, 300, 100, 300, 300, 300, 100]);
         assert_eq!(received[1], vec![1; 300]);
         assert_eq!(received[4], vec![9; 300]);
+    }
+
+    /// An error is received as it occurs, without a datagram
+    #[tokio::test]
+    async fn receive_error() {
+        let addr = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a.connect(addr).await.unwrap();
+        let mut receiver = Receiver::new(0);
+        let recv = receiver.recv(&a);
+        tokio::pin!(recv);
+        // waiting already when the datagram is refused
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut recv)
+                .await
+                .is_err()
+        );
+        a.send(&[1; 10]).await.unwrap();
+        let e = tokio::time::timeout(Duration::from_secs(1), recv)
+            .await
+            .expect("the error is not received")
+            .unwrap_err();
+        assert!(is_refused(&e));
+        assert!(a.take_error().unwrap().is_none());
+    }
+
+    /// Datagrams sent after one was refused, while nothing listened, arrive once something does
+    #[tokio::test]
+    async fn send_after_refused() {
+        for gso in [true, false] {
+            let addr = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            a.connect(addr).await.unwrap();
+            // the ICMP message comes back over loopback before this returns
+            a.send(&[1; 10]).await.unwrap();
+            let b = UdpSocket::bind(addr).await.unwrap();
+
+            Sender::new(gso)
+                .send_segments(&a, &[2; 20], 10)
+                .await
+                .unwrap();
+            let mut buf = [0; 100];
+            for _ in 0..2 {
+                assert_eq!(b.recv(&mut buf).await.unwrap(), 10);
+                assert_eq!(buf[..10], [2; 10]);
+            }
+        }
     }
 }
