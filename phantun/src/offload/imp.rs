@@ -33,10 +33,8 @@ struct Tuple {
     family: u32,
 }
 
-/// CONV_NIC
-const CONV_NIC: u32 = 1;
 /// CONV_USER_RX
-const CONV_USER_RX: u32 = 2;
+const CONV_USER_RX: u32 = 1;
 
 /// struct conversion
 #[repr(C)]
@@ -212,11 +210,8 @@ impl Drop for States {
 unsafe impl Send for States {}
 unsafe impl Sync for States {}
 
-/// The programs that convert on network interfaces
+/// The programs for network interfaces
 struct NicPrograms {
-    /// For the ingress of the Tun interface, sends Phantun's own packets out of the network
-    /// interface
-    tun_ingress: i32,
     /// For interfaces with an Ethernet header
     ingress_eth: i32,
     /// For interfaces without one
@@ -232,9 +227,7 @@ pub struct Offload {
     free_slots: Mutex<Vec<u32>>,
     tun: String,
     tun_ifindex: u32,
-    /// Unless the conversion on network interfaces is disabled, or its programs cannot be
-    /// loaded, why
-    nic_programs: Result<NicPrograms, String>,
+    nic_programs: NicPrograms,
     /// The filters on the loopback and network interfaces, the ones on the Tun interface go with
     /// it. The network interfaces get theirs once a connection uses them, by index.
     filters: Mutex<HashMap<u32, Vec<FilterId>>>,
@@ -253,16 +246,10 @@ pub struct Offload {
 
 impl Offload {
     /// Loads the programs for the Tun interface `tun`. With `fec`, records of FEC frames are
-    /// passed to Phantun, otherwise the buffer for them is kept small. With `nic`, the packets of
-    /// connections are converted on their network interface where possible, and `remote`, the
-    /// address of the Tun interface and the remote end of the connections, if known, helps to find
-    /// it in advance.
-    pub fn new(
-        tun: &str,
-        fec: bool,
-        nic: bool,
-        remote: Option<(IpAddr, IpAddr)>,
-    ) -> Result<Offload, String> {
+    /// passed to Phantun, otherwise the buffer for them is kept small. `remote`, the address of
+    /// the Tun interface and the remote end of the connections, if known, helps to find their
+    /// network interface in advance.
+    pub fn new(tun: &str, fec: bool, remote: Option<(IpAddr, IpAddr)>) -> Result<Offload, String> {
         let tun_ifindex = if_index(tun).ok_or_else(|| format!("no interface {tun}"))?;
         // a power of two and a multiple of the page size
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u32;
@@ -277,28 +264,12 @@ impl Offload {
             .load(OBJECT)
             .map_err(|e| format!("unable to load the eBPF programs: {e}"))?;
 
-        let tcp_to_udp = load_program(&mut ebpf, "tcp_to_udp")?;
         let udp_to_tcp = load_program(&mut ebpf, "udp_to_tcp")?;
-        let redirect = load_program(&mut ebpf, "redirect")?;
-        // Without the programs for network interfaces, the packets are still converted on the Tun
-        // interface
-        let nic_programs = if nic {
-            let mut load = || -> Result<NicPrograms, String> {
-                Ok(NicPrograms {
-                    tun_ingress: load_program(&mut ebpf, "tun_ingress")?,
-                    ingress_eth: load_program(&mut ebpf, "nic_ingress_eth")?,
-                    ingress_l3: load_program(&mut ebpf, "nic_ingress_l3")?,
-                    redirect,
-                })
-            };
-            load().inspect_err(|e| {
-                info!(
-                    "eBPF data path unavailable on network interfaces, packets are converted on \
-                     the Tun interface: {e}"
-                )
-            })
-        } else {
-            Err("disabled by --no-ebpf-nic".to_string())
+        let tun_ingress = load_program(&mut ebpf, "tun_ingress")?;
+        let nic_programs = NicPrograms {
+            ingress_eth: load_program(&mut ebpf, "nic_ingress_eth")?,
+            ingress_l3: load_program(&mut ebpf, "nic_ingress_l3")?,
+            redirect: load_program(&mut ebpf, "redirect")?,
         };
 
         let take_hash_map = |ebpf: &mut Ebpf, name| {
@@ -331,10 +302,8 @@ impl Offload {
             _ebpf: ebpf,
         };
         // On failure, dropping `offload` removes the filters attached so far
-        offload.attach(tcp_to_udp, udp_to_tcp, redirect)?;
-        if offload.nic_programs.is_ok() {
-            offload.prepare_nics(remote);
-        }
+        offload.attach(udp_to_tcp, tun_ingress)?;
+        offload.prepare_nics(remote);
 
         offload.ipv4_unavailable = enable_ipv4_delivery().err();
         if let Some(ref e) = offload.ipv4_unavailable {
@@ -347,7 +316,7 @@ impl Offload {
         format!("{FILTER_NAME_PREFIX}{}", self.tun)
     }
 
-    fn attach(&self, tcp_to_udp: i32, udp_to_tcp: i32, redirect: i32) -> Result<(), String> {
+    fn attach(&self, udp_to_tcp: i32, tun_ingress: i32) -> Result<(), String> {
         let mut nl = Netlink::new().map_err(|e| format!("netlink: {e}"))?;
         let name = self.filter_name();
         let tun_ifindex = self.tun_ifindex;
@@ -364,13 +333,13 @@ impl Offload {
             priority,
             handle,
         };
-        let mut filters = vec![
+        let redirect = self.nic_programs.redirect;
+        let filters = [
             (
-                filter(tun_ifindex, Direction::Egress, 1, 1),
-                tcp_to_udp,
-                Some(netlink::TCA_CSUM_UPDATE_FLAG_IPV4HDR | netlink::TCA_CSUM_UPDATE_FLAG_UDP),
+                filter(tun_ifindex, Direction::Ingress, 1, 1),
+                tun_ingress,
+                None,
             ),
-            (filter(tun_ifindex, Direction::Egress, 2, 1), redirect, None),
             (
                 filter(
                     LOOPBACK_IFINDEX,
@@ -392,13 +361,6 @@ impl Offload {
                 None,
             ),
         ];
-        if let Ok(ref programs) = self.nic_programs {
-            filters.push((
-                filter(tun_ifindex, Direction::Ingress, 1, 1),
-                programs.tun_ingress,
-                None,
-            ));
-        }
         for (id, fd, csum_flags) in filters {
             nl.add_bpf_filter(id, fd, &name, csum_flags)
                 .map_err(|e| format!("unable to attach a tc filter: {e}"))?;
@@ -448,7 +410,7 @@ impl Offload {
 
     /// Attaches the programs to the network interface `ifindex`, unless they are already
     fn attach_nic(&self, nl: &mut Netlink, ifindex: u32, eth: bool) -> Result<(), String> {
-        let programs = self.nic_programs.as_ref().unwrap();
+        let programs = &self.nic_programs;
         let mut filters = self.filters.lock().unwrap();
         if filters.contains_key(&ifindex) {
             return Ok(());
@@ -524,16 +486,20 @@ impl Offload {
         }
     }
 
-    /// The network interface of the fake TCP connection from `local` to `remote` on the Tun
-    /// interface, with the programs attached, and its addresses there, which NAT may have changed
-    fn nic_path(&self, local: SocketAddr, remote: SocketAddr) -> Result<NicPath, String> {
-        let mut nl = Netlink::new().map_err(|e| format!("netlink: {e}"))?;
-        // Where the kernel sends the packets Phantun writes to the Tun interface
+    /// The network interface that the kernel forwards the packets from `local` to `remote` on the
+    /// Tun interface to, if the programs support it: its index, name, and whether it has an
+    /// Ethernet header
+    fn nic(
+        &self,
+        nl: &mut Netlink,
+        local: IpAddr,
+        remote: IpAddr,
+    ) -> Result<(u32, String, bool), String> {
         let ifindex = nl
-            .forward_interface(local.ip(), remote.ip(), self.tun_ifindex)
-            .map_err(|e| format!("no route to {} from the Tun interface: {e}", remote.ip()))?;
+            .forward_interface(local, remote, self.tun_ifindex)
+            .map_err(|e| format!("no route to {remote} from the Tun interface: {e}"))?;
         if ifindex == self.tun_ifindex || ifindex == LOOPBACK_IFINDEX {
-            return Err(format!("{} is routed to the host itself", remote.ip()));
+            return Err(format!("{remote} is routed to the host itself"));
         }
         let (link_type, name) = nl
             .link(ifindex)
@@ -543,6 +509,14 @@ impl Offload {
             ARPHRD_NONE | ARPHRD_PPP | ARPHRD_RAWIP => false,
             t => return Err(format!("{name} is of an unsupported type ({t})")),
         };
+        Ok((ifindex, name, eth))
+    }
+
+    /// The network interface of the fake TCP connection from `local` to `remote` on the Tun
+    /// interface, with the programs attached, and its addresses there, which NAT may have changed
+    fn nic_path(&self, local: SocketAddr, remote: SocketAddr) -> Result<NicPath, String> {
+        let mut nl = Netlink::new().map_err(|e| format!("netlink: {e}"))?;
+        let (ifindex, name, eth) = self.nic(&mut nl, local.ip(), remote.ip())?;
 
         let (wire_local, wire_remote) = Netlink::conntrack()
             .and_then(|mut ct| ct.conntrack_wire_addresses(local, remote))
@@ -562,15 +536,8 @@ impl Offload {
         })
     }
 
-    pub fn register(
-        self: &Arc<Self>,
-        sock: &mut Socket,
-        udp_local: SocketAddr,
-        udp_peer: SocketAddr,
-    ) -> Result<Arc<Connection>, String> {
-        let (udp_local, udp_peer) = (canonical(udp_local), canonical(udp_peer));
-        let (tcp_local, tcp_remote) = (canonical(sock.local_addr()), canonical(sock.remote_addr()));
-
+    /// Whether the datagrams of `udp_peer` can be delivered by the programs
+    fn check_udp_peer(&self, udp_peer: SocketAddr) -> Result<(), String> {
         if let IpAddr::V6(ip) = udp_peer.ip()
             && ip.is_unicast_link_local()
         {
@@ -582,6 +549,33 @@ impl Offload {
         if let (true, Some(e)) = (udp_peer.is_ipv4(), &self.ipv4_unavailable) {
             return Err(e.clone());
         }
+        Ok(())
+    }
+
+    /// Whether a connection from `tcp_local` to `tcp_remote` on the Tun interface for `udp_peer`
+    /// is likely to be converted, before it exists. Whether NAT allows it is only known once it
+    /// does, see [`Offload::register`].
+    pub fn may_convert(
+        &self,
+        udp_peer: SocketAddr,
+        tcp_local: IpAddr,
+        tcp_remote: IpAddr,
+    ) -> Result<(), String> {
+        self.check_udp_peer(canonical(udp_peer))?;
+        let mut nl = Netlink::new().map_err(|e| format!("netlink: {e}"))?;
+        self.nic(&mut nl, tcp_local.to_canonical(), tcp_remote.to_canonical())
+            .map(|_| ())
+    }
+
+    pub fn register(
+        self: &Arc<Self>,
+        sock: &mut Socket,
+        udp_local: SocketAddr,
+        udp_peer: SocketAddr,
+    ) -> Result<Arc<Connection>, String> {
+        let (udp_local, udp_peer) = (canonical(udp_local), canonical(udp_peer));
+        let (tcp_local, tcp_remote) = (canonical(sock.local_addr()), canonical(sock.remote_addr()));
+        self.check_udp_peer(udp_peer)?;
 
         let mismatch = || format!("{udp_local} and {udp_peer} are of different IP versions");
         // fake TCP packets from the remote end, and datagrams from the UDP peer
@@ -590,10 +584,7 @@ impl Offload {
         let to_udp = Tuple::new(udp_local, udp_peer).ok_or_else(mismatch)?;
         let to_tcp = Tuple::new(tcp_local, tcp_remote).ok_or_else(mismatch)?;
 
-        let nic = match self.nic_programs {
-            Err(ref e) => Err(e.clone()),
-            Ok(_) => self.nic_path(tcp_local, tcp_remote),
-        };
+        let path = self.nic_path(tcp_local, tcp_remote)?;
 
         let slot = self
             .free_slots
@@ -609,39 +600,19 @@ impl Offload {
 
         let conversion = |out, ifindex| Conversion {
             out,
+            tun: tcp_key,
             slot,
             ifindex,
             ..Default::default()
         };
-        // Fake TCP packets that reach the Tun interface are converted there in any case, e.g.
-        // those arriving on another network interface
-        let mut entries = vec![(Table::Tcp, tcp_key, conversion(to_udp, 0))];
-        let location = match nic {
-            Ok(ref path) => {
-                // Both are of the same IP version as on the Tun interface
-                let wire_key = Tuple::new(path.remote, path.local).unwrap();
-                let wire_out = Tuple::new(path.local, path.remote).unwrap();
-                let nic_conversion = |out, ifindex| Conversion {
-                    tun: tcp_key,
-                    flags: CONV_NIC,
-                    ..conversion(out, ifindex)
-                };
-                // Without NAT, it is the same key
-                entries.retain(|(_, key, _)| *key != wire_key);
-                entries.push((
-                    Table::Tcp,
-                    wire_key,
-                    nic_conversion(to_udp, self.tun_ifindex),
-                ));
-                entries.push((Table::Udp, udp_key, nic_conversion(wire_out, path.ifindex)));
-                entries.push((Table::Tun, to_tcp, nic_conversion(wire_out, path.ifindex)));
-                Location::Nic(path.name.clone())
-            }
-            Err(e) => {
-                entries.push((Table::Udp, udp_key, conversion(to_tcp, self.tun_ifindex)));
-                Location::Tun(e)
-            }
-        };
+        // Both are of the same IP version as on the Tun interface
+        let wire_key = Tuple::new(path.remote, path.local).unwrap();
+        let wire_out = Tuple::new(path.local, path.remote).unwrap();
+        let mut entries = vec![
+            (Table::Tcp, wire_key, conversion(to_udp, self.tun_ifindex)),
+            (Table::Udp, udp_key, conversion(wire_out, path.ifindex)),
+            (Table::Tun, to_tcp, conversion(wire_out, path.ifindex)),
+        ];
 
         // The other end may send merged packets, which only user space can take, and all of them
         // have to take the same path to stay in order
@@ -657,7 +628,7 @@ impl Offload {
             offload: self.clone(),
             slot,
             entries,
-            location,
+            nic: path.name,
             fec_id: Mutex::new(None),
             name: sock.to_string(),
         });
@@ -710,14 +681,6 @@ enum Table {
     Tcp,
     Udp,
     Tun,
-}
-
-/// Where the fake TCP packets of a connection are converted
-enum Location {
-    /// On the network interface of this name
-    Nic(String),
-    /// On the Tun interface, as the network interface cannot be used for this reason
-    Tun(String),
 }
 
 /// The converted datagrams enter the loopback interface without a route, so the kernel looks one
@@ -779,7 +742,8 @@ pub struct Connection {
     slot: u32,
     /// What to insert into the maps when it starts
     entries: Vec<(Table, Tuple, Conversion)>,
-    location: Location,
+    /// The name of the network interface its packets are converted on
+    nic: String,
     /// The ID of its FEC records, if it uses FEC
     fec_id: Mutex<Option<u32>>,
     name: String,
@@ -839,15 +803,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Where its packets are converted, for the log
-    pub fn location(&self) -> String {
-        match self.location {
-            Location::Nic(ref name) => format!("on {name}"),
-            Location::Tun(ref reason) => format!(
-                "on the Tun interface {} (not on the network interface: {reason})",
-                self.offload.tun
-            ),
-        }
+    /// The name of the network interface its packets are converted on
+    pub fn nic(&self) -> &str {
+        &self.nic
     }
 
     /// Shares the FEC claims with the eBPF programs and has the records of the connection passed

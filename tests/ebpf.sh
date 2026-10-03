@@ -2,14 +2,15 @@
 #
 # Tests the eBPF data path end to end: a client and a server in two network namespaces exchange
 # datagrams with an echo service through Phantun, and the test checks that they arrive intact and
-# that the eBPF programs converted them where expected: on the network interface, on the Tun
-# interface with --no-ebpf-nic, or not at all with --no-ebpf. With FEC, the link loses packets,
+# that the eBPF programs converted them where expected: on the network interface, or not at all
+# with --no-ebpf or where the network interface is not supported. With FEC, the link loses packets,
 # which have to be recovered.
 #
 # Usage: sudo tests/ebpf.sh [directory with the server and client binaries, default target/debug]
 #
 # Needs root, iproute2, iptables, python3 and the netem qdisc. With wg (wireguard-tools), it also
-# tests a network interface without an Ethernet header, by running Phantun over WireGuard.
+# tests a network interface without an Ethernet header, by running Phantun over WireGuard, and with
+# the ipip module, one that is not supported.
 
 set -euo pipefail
 
@@ -187,6 +188,18 @@ setup_wg() {
   ip netns exec $NS_S iptables -t nat -A PREROUTING -p tcp -i phantun-ws --dport 4567 -j DNAT --to-destination 192.168.201.2
 }
 
+# setup_ipip: an IPIP tunnel between both namespaces, over the veth link, for fake TCP
+setup_ipip() {
+  ip -n $NS_C link add phantun-ic type ipip local 10.199.0.1 remote 10.199.0.2
+  ip -n $NS_S link add phantun-is type ipip local 10.199.0.2 remote 10.199.0.1
+  ip -n $NS_C addr add 10.197.0.1/24 dev phantun-ic
+  ip -n $NS_S addr add 10.197.0.2/24 dev phantun-is
+  ip -n $NS_C link set phantun-ic up
+  ip -n $NS_S link set phantun-is up
+  ip netns exec $NS_C iptables -t nat -A POSTROUTING -s 192.168.200.2 -o phantun-ic -j MASQUERADE
+  ip netns exec $NS_S iptables -t nat -A PREROUTING -p tcp -i phantun-is --dport 4567 -j DNAT --to-destination 192.168.201.2
+}
+
 # converted <namespace> <interface> <ingress|egress> <program>: the number of fake TCP packets
 # that the program converted (or passed to Phantun) on the interface, nothing without the program
 converted() {
@@ -200,10 +213,10 @@ loss() {
   ip netns exec $NS_S tc qdisc replace dev phantun-ts root netem loss "$1%"
 }
 
-# run <name> <server address> <echo address> <local address> <expect eBPF: nic|server|tun|no>
+# run <name> <server address> <echo address> <local address> <expect eBPF: nic|server|no|batches>
 #   [phantun args]: with `server`, only the server converts on the network interface, and only the
-#   packets it sends, as the client merges packets. SERVER_ARGS and CLIENT_ARGS are passed to one
-#   side only.
+#   packets it sends, as the client merges packets. With `batches`, neither converts, and both
+#   merge packets. SERVER_ARGS and CLIENT_ARGS are passed to one side only.
 run() {
   local name=$1 server=$2 remote=$3 local=$4 expect=$5
   shift 5
@@ -219,9 +232,7 @@ run() {
   host=${host%]}
   local ok
   ok=$(ip netns exec $NS_C python3 "$WORK/echo.py" client "$host" "$port" $COUNT 1000)
-  local s_tun c_tun s_nic c_nic
-  s_tun=$(converted $NS_S phantun-ts0 egress tcp_to_udp || true)
-  c_tun=$(converted $NS_C phantun-tc0 egress tcp_to_udp || true)
+  local s_nic c_nic
   s_nic=$(converted $NS_S $NIC_S ingress $NIC_PROG || true)
   c_nic=$(converted $NS_C $NIC_C ingress $NIC_PROG || true)
 
@@ -236,32 +247,32 @@ run() {
   # Only the first datagram takes the user space path
   case $expect in
     nic)
-      if [ "${s_nic:-0}" -lt $((COUNT - 5)) ] || [ "${c_nic:-0}" -lt $((COUNT - 5)) ] \
-        || [ "${s_tun:-0}" -gt 5 ] || [ "${c_tun:-0}" -gt 5 ]; then
+      if [ "${s_nic:-0}" -lt $((COUNT - 5)) ] || [ "${c_nic:-0}" -lt $((COUNT - 5)) ]; then
         result=fail
       fi
       ;;
     server)
       # the program on the network interface passes those received to Phantun
-      if [ "${s_nic:-0}" -lt $((COUNT - 5)) ] || [ -n "$c_nic$c_tun" ] || [ "${s_tun:-0}" -gt 5 ] \
+      if [ "${s_nic:-0}" -lt $((COUNT - 5)) ] || [ -n "$c_nic" ] \
         || ! grep -q "those received pass through Phantun" "$WORK/server.log"; then
         result=fail
       fi
       ;;
-    tun)
-      if [ "${s_tun:-0}" -lt $((COUNT - 5)) ] || [ "${c_tun:-0}" -lt $((COUNT - 5)) ] \
-        || [ -n "$s_nic$c_nic" ]; then
+    no)
+      if [ "${s_nic:-0}" -gt 0 ] || [ "${c_nic:-0}" -gt 0 ]; then
         result=fail
       fi
       ;;
-    no)
-      if [ -n "$s_tun$c_tun$s_nic$c_nic" ] && [ "${s_tun:-0}${c_tun:-0}" != 00 ]; then
+    batches)
+      if [ "${s_nic:-0}" -gt 0 ] || [ "${c_nic:-0}" -gt 0 ] \
+        || ! grep -q "pass in batches both ways" "$WORK/server.log" \
+        || ! grep -q "pass in batches both ways" "$WORK/client.log"; then
         result=fail
       fi
       ;;
   esac
   echo "echoed $ok/$COUNT, converted by eBPF on the network interface: server ${s_nic:-none}," \
-    "client ${c_nic:-none}, on the Tun interface: server ${s_tun:-none}, client ${c_tun:-none}: $result"
+    "client ${c_nic:-none}: $result"
   if [ $result = fail ]; then
     failed=1
     echo "--- server log"; cat "$WORK/server.log"
@@ -431,11 +442,8 @@ run "IPv4" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic
 run "IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic
 run "IPv6 fake TCP, IPv4 UDP" "[fd99:199::2]:4567" 127.0.0.1:7777 127.0.0.1:1984 nic
 run "IPv4 fake TCP, IPv6 UDP" 10.199.0.2:4567 "[::1]:7777" "[::1]:1984" nic
-run "IPv4, --no-ebpf-nic" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 tun --no-ebpf-nic
-run "IPv6, --no-ebpf-nic" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" tun --no-ebpf-nic
 run "--no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --no-ebpf
 # Through conntrack on both ends
-oneway "One way, --no-ebpf-nic" --no-ebpf-nic
 oneway "One way, --no-ebpf" --no-ebpf
 burst "At once, --no-ebpf" --no-ebpf
 burst "At once, --no-ebpf --no-gso" --no-ebpf --no-gso
@@ -450,7 +458,6 @@ lost_ack
 loss 5
 run "FEC with 5% loss" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 nic --fec 4:2
 run "FEC with 5% loss, IPv6" "[fd99:199::2]:4567" "[::1]:7777" "[::1]:1984" nic --fec 4:2
-run "FEC with 5% loss, --no-ebpf-nic" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 tun --fec 4:2 --no-ebpf-nic
 run "FEC with 5% loss, --no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 no --fec 4:2 --no-ebpf
 CLIENT_ARGS=--no-ebpf run "FEC with 5% loss, client --no-ebpf" 10.199.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 server --fec 4:2
 loss 0
@@ -463,6 +470,14 @@ if command -v wg > /dev/null && setup_wg 2> /dev/null; then
   loss 0
 else
   echo "=== Over WireGuard: skipped, WireGuard is not available"
+fi
+
+# Connections on an unsupported network interface pass through Phantun, in batches
+if setup_ipip 2> /dev/null; then
+  NIC_C=phantun-ic NIC_S=phantun-is NIC_PROG=nic_ingress_eth
+  run "Over IPIP" 10.197.0.2:4567 127.0.0.1:7777 127.0.0.1:1984 batches
+else
+  echo "=== Over IPIP: skipped, IPIP is not available"
 fi
 
 exit $failed
