@@ -61,7 +61,9 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tun::*;
 
+/// How long the handshake waits for an answer before sending its SYN or SYN + ACK again
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
+/// How many times the handshake sends its SYN or SYN + ACK before giving up
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MPSC_BUFFER_LEN: usize = 128;
@@ -510,6 +512,19 @@ impl Socket {
                     return None;
                 }
 
+                // The server sends its SYN + ACK again until it gets the ACK of the handshake,
+                // or a data packet in its place, which may not come for a while
+                if (tcp_packet.get_flags() & tcp::TcpFlags::SYN) != 0 {
+                    let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                    if let Err(e) = self.tun.try_send(&buf) {
+                        info!("Connection {} unable to send ACK again: {}", self, e);
+                    }
+                    return Some(Datagrams {
+                        payload: Bytes::new(),
+                        len: 0,
+                    });
+                }
+
                 let payload = tcp_packet.payload();
 
                 let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
@@ -543,127 +558,130 @@ impl Socket {
     }
 
     async fn accept(mut self) {
+        // The SYN + ACK is sent again when the client repeats its SYN, as it did not get the SYN +
+        // ACK then, or when nothing arrives in time
         for _ in 0..RETRIES {
-            match self.state {
-                State::Idle => {
-                    let buf = self.build_handshake_packet(tcp::TcpFlags::SYN | tcp::TcpFlags::ACK);
-                    // ACK set by constructor
-                    self.tun.send(&buf).await.unwrap();
-                    self.state = State::SynReceived;
-                    info!("Sent SYN + ACK to client");
+            let buf = self.build_handshake_packet(tcp::TcpFlags::SYN | tcp::TcpFlags::ACK);
+            // ACK set by constructor
+            self.tun.send(&buf).await.unwrap();
+            self.state = State::SynReceived;
+            info!("Sent SYN + ACK to client");
+
+            let deadline = time::Instant::now() + TIMEOUT;
+            loop {
+                let Ok(received) = time::timeout_at(deadline, self.incoming.recv_async()).await
+                else {
+                    info!("Waiting for client ACK timed out");
+                    break;
+                };
+                let received = received.unwrap();
+                let (_v4_packet, tcp_packet) = parse_ip_packet(&received.packet).unwrap();
+                let flags = tcp_packet.get_flags();
+
+                if (flags & tcp::TcpFlags::RST) != 0 {
+                    return;
                 }
-                State::SynReceived => {
-                    let res = time::timeout(TIMEOUT, self.incoming.recv_async()).await;
-                    if let Ok(received) = res {
-                        let received = received.unwrap();
-                        let (_v4_packet, tcp_packet) = parse_ip_packet(&received.packet).unwrap();
 
-                        if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
-                            return;
-                        }
+                if flags == tcp::TcpFlags::SYN
+                    && tcp_packet.get_sequence().wrapping_add(1)
+                        == self.numbers().ack.load(Ordering::Relaxed)
+                {
+                    info!("Client sent its SYN again");
+                    break;
+                }
 
-                        // a lost ACK may be replaced by the first data packet, which carries PSH
-                        if tcp_packet.get_flags() & !tcp::TcpFlags::PSH == tcp::TcpFlags::ACK
-                            && tcp_packet.get_acknowledgement()
-                                == self.numbers().seq.load(Ordering::Relaxed) + 1
-                        {
-                            // found our ACK
-                            self.numbers().seq.fetch_add(1, Ordering::Relaxed);
-                            if !self.peer_merges() {
-                                self.numbers().flags.fetch_or(FLAG_PSH, Ordering::Relaxed);
-                            }
-                            self.state = State::Established;
-
-                            // The window of the SYN + ACK cannot be scaled, so stateful firewalls
-                            // such as conntrack only let 64 KB through from the client, and no
-                            // longer NAT what follows, until they see another packet from here
-                            // with the scaled window. Send one now, as otherwise the next one may
-                            // only be the ACK after MAX_UNACKED_LEN if traffic only goes one way.
-                            let ack = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
-                            if let Err(e) = self.tun.send(&ack).await {
-                                warn!("Unable to send ACK to {}: {}", self.remote_addr, e);
-                            }
-
-                            // When a data packet replaced the ACK, its datagram is still passed
-                            // on, after the packets queued behind it
-                            if !tcp_packet.payload().is_empty() {
-                                let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
-                                let incoming =
-                                    self.shared.tuples.read().unwrap().get(&tuple).cloned();
-                                if let Some(incoming) = incoming
-                                    && incoming.try_send(received.clone()).is_err()
-                                {
-                                    trace!("Queue of {} full, dropping first packet", self);
-                                }
-                            }
-
-                            info!("Connection from {:?} established", self.remote_addr);
-                            let ready = self.shared.ready.clone();
-                            if let Err(e) = ready.send(self).await {
-                                error!("Unable to send accepted socket to ready queue: {}", e);
-                            }
-                            return;
-                        }
-                    } else {
-                        info!("Waiting for client ACK timed out");
-                        self.state = State::Idle;
+                // a lost ACK may be replaced by the first data packet, which carries PSH
+                if flags & !tcp::TcpFlags::PSH == tcp::TcpFlags::ACK
+                    && tcp_packet.get_acknowledgement()
+                        == self.numbers().seq.load(Ordering::Relaxed) + 1
+                {
+                    // found our ACK
+                    self.numbers().seq.fetch_add(1, Ordering::Relaxed);
+                    if !self.peer_merges() {
+                        self.numbers().flags.fetch_or(FLAG_PSH, Ordering::Relaxed);
                     }
+                    self.state = State::Established;
+
+                    // The window of the SYN + ACK cannot be scaled, so stateful firewalls such as
+                    // conntrack only let 64 KB through from the client, and no longer NAT what
+                    // follows, until they see another packet from here with the scaled window.
+                    // Send one now, as otherwise the next one may only be the ACK after
+                    // MAX_UNACKED_LEN if traffic only goes one way.
+                    let ack = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                    if let Err(e) = self.tun.send(&ack).await {
+                        warn!("Unable to send ACK to {}: {}", self.remote_addr, e);
+                    }
+
+                    // When a data packet replaced the ACK, its datagram is still passed on, after
+                    // the packets queued behind it
+                    if !tcp_packet.payload().is_empty() {
+                        let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
+                        let incoming = self.shared.tuples.read().unwrap().get(&tuple).cloned();
+                        if let Some(incoming) = incoming
+                            && incoming.try_send(received.clone()).is_err()
+                        {
+                            trace!("Queue of {} full, dropping first packet", self);
+                        }
+                    }
+
+                    info!("Connection from {:?} established", self.remote_addr);
+                    let ready = self.shared.ready.clone();
+                    if let Err(e) = ready.send(self).await {
+                        error!("Unable to send accepted socket to ready queue: {}", e);
+                    }
+                    return;
                 }
-                _ => unreachable!(),
+
+                // anything else, such as a late packet of an earlier connection, is ignored
             }
         }
     }
 
     async fn connect(&mut self) -> Option<()> {
         for _ in 0..RETRIES {
-            match self.state {
-                State::Idle => {
-                    let buf = self.build_handshake_packet(tcp::TcpFlags::SYN);
-                    self.tun.send(&buf).await.unwrap();
-                    self.state = State::SynSent;
-                    info!("Sent SYN to server");
+            let buf = self.build_handshake_packet(tcp::TcpFlags::SYN);
+            self.tun.send(&buf).await.unwrap();
+            self.state = State::SynSent;
+            info!("Sent SYN to server");
+
+            let deadline = time::Instant::now() + TIMEOUT;
+            loop {
+                let Ok(received) = time::timeout_at(deadline, self.incoming.recv_async()).await
+                else {
+                    info!("Waiting for SYN + ACK timed out");
+                    break;
+                };
+                let received = received.unwrap();
+                let (_v4_packet, tcp_packet) = parse_ip_packet(&received.packet).unwrap();
+
+                if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
+                    return None;
                 }
-                State::SynSent => {
-                    match time::timeout(TIMEOUT, self.incoming.recv_async()).await {
-                        Ok(received) => {
-                            let received = received.unwrap();
-                            let (_v4_packet, tcp_packet) =
-                                parse_ip_packet(&received.packet).unwrap();
 
-                            if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
-                                return None;
-                            }
-
-                            if tcp_packet.get_flags() == tcp::TcpFlags::SYN | tcp::TcpFlags::ACK
-                                && tcp_packet.get_acknowledgement()
-                                    == self.numbers().seq.load(Ordering::Relaxed) + 1
-                            {
-                                // found our SYN + ACK
-                                self.numbers().seq.fetch_add(1, Ordering::Relaxed);
-                                self.numbers()
-                                    .ack
-                                    .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
-                                if tcp_packet.get_window() == MERGE_WINDOW {
-                                    self.numbers().flags.fetch_or(FLAG_MERGE, Ordering::Relaxed);
-                                }
-
-                                // send ACK to finish handshake
-                                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
-                                self.tun.send(&buf).await.unwrap();
-
-                                self.state = State::Established;
-
-                                info!("Connection to {:?} established", self.remote_addr);
-                                return Some(());
-                            }
-                        }
-                        Err(_) => {
-                            info!("Waiting for SYN + ACK timed out");
-                            self.state = State::Idle;
-                        }
+                if tcp_packet.get_flags() == tcp::TcpFlags::SYN | tcp::TcpFlags::ACK
+                    && tcp_packet.get_acknowledgement()
+                        == self.numbers().seq.load(Ordering::Relaxed) + 1
+                {
+                    // found our SYN + ACK
+                    self.numbers().seq.fetch_add(1, Ordering::Relaxed);
+                    self.numbers()
+                        .ack
+                        .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
+                    if tcp_packet.get_window() == MERGE_WINDOW {
+                        self.numbers().flags.fetch_or(FLAG_MERGE, Ordering::Relaxed);
                     }
+
+                    // send ACK to finish handshake
+                    let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                    self.tun.send(&buf).await.unwrap();
+
+                    self.state = State::Established;
+
+                    info!("Connection to {:?} established", self.remote_addr);
+                    return Some(());
                 }
-                _ => unreachable!(),
+
+                // anything else is ignored
             }
         }
 
