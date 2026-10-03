@@ -275,7 +275,10 @@ struct state {
 	// The FEC group (upper half) and the number of data shards in it so far (lower half), shared
 	// with user space, which also sends data shards and closes groups that are not filled in time
 	__u64 fec_claims;
-	__u64 _pad2[2];
+	// Packets of a connection with FEC left to user space, as the ring buffer for records was full.
+	// Like tx and rx, the increments do not need to be atomic.
+	__u64 fec_full;
+	__u64 _pad2;
 };
 
 // FEC frames for user space, which computes parity shards from data shards sent, and recovers
@@ -604,8 +607,10 @@ static __always_inline int convert_tcp(struct __sk_buff *skb, struct headers *h,
 			return CLS_NO_MATCH;
 		// When there is no room, user space gets the packet itself
 		rec = bpf_ringbuf_reserve(&records, sizeof(*rec), 0);
-		if (!rec)
+		if (!rec) {
+			s->fec_full++;
 			return CLS_NO_MATCH;
+		}
 		rec->fec_id = c->fec_id;
 
 		if (fec[0] == FEC_TYPE_PARITY) {
@@ -754,8 +759,10 @@ int udp_to_tcp(struct __sk_buff *skb)
 	if (fec_id) {
 		// When there is no room, user space gets the datagram itself
 		rec = bpf_ringbuf_reserve(&records, sizeof(*rec), 0);
-		if (!rec)
+		if (!rec) {
+			s->fec_full++;
 			return CLS_NO_MATCH;
+		}
 		rec->fec_id = fec_id;
 		rec->kind = RECORD_SENT_DATA;
 		if (load_record(skb, h.l4_off + sizeof(udp), rec, payload_len)) {
