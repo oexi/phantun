@@ -197,8 +197,9 @@ pub fn write_headers(buf: &mut [u8], h: Headers, payload_len: usize, payload: Op
 }
 
 /// The length of the IP packet in `buf` whose header says it is `len` bytes long. Bytes after it,
-/// such as the padding of a short Ethernet frame passed on by the eBPF programs of Phantun, are not
-/// part of it. A length of zero, as for packets merged beyond 64 KiB, or beyond `buf` is not
+/// such as the padding of a short Ethernet frame, are not part of it. Neither the kernel nor the
+/// eBPF programs of Phantun pass such bytes on, this only keeps them out of the payload if anything
+/// ever does. A length of zero, as for packets merged beyond 64 KiB, or beyond `buf` is not
 /// trusted, and the packet is taken to fill `buf`.
 fn ip_len(len: usize, buf: &[u8]) -> usize {
     if len == 0 || len > buf.len() {
