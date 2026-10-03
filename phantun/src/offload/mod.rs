@@ -197,6 +197,10 @@ mod imp {
         pub fn packets(&self) -> u64 {
             match *self {}
         }
+
+        pub fn fec_full(&self) -> u64 {
+            match *self {}
+        }
     }
 }
 #[cfg(not(ebpf))]

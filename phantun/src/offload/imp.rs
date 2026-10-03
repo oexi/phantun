@@ -65,7 +65,8 @@ struct State {
     tx: UnsafeCell<u64>,
     rx: UnsafeCell<u64>,
     fec_claims: FecClaims,
-    _pad2: [u64; 2],
+    fec_full: UnsafeCell<u64>,
+    _pad2: u64,
 }
 
 /// The header of struct record, followed by the data
@@ -73,8 +74,10 @@ const RECORD_HEADER_LEN: usize = 16;
 const RECORD_SENT_DATA: u32 = 0;
 const RECORD_RECEIVED_DATA: u32 = 1;
 const RECORD_RECEIVED_PARITY: u32 = 2;
-/// The size of the ring buffer for records, when FEC is enabled. Each record takes about 1.5 KiB.
-const RECORDS_SIZE: u32 = 8 * 1024 * 1024;
+/// The size of the ring buffer for records, when FEC is enabled. Each record takes about 1.5 KiB,
+/// so it holds about 150 ms at 1.5 Gbit/s. When it is full, packets take the path through Phantun,
+/// out of order with the others.
+const RECORDS_SIZE: u32 = 32 * 1024 * 1024;
 
 const _: () = assert!(size_of::<Tuple>() == 40);
 const _: () = assert!(size_of::<Conversion>() == 104);
@@ -596,6 +599,7 @@ impl Offload {
         unsafe {
             std::ptr::write_volatile(state.tx.get(), 0);
             std::ptr::write_volatile(state.rx.get(), 0);
+            std::ptr::write_volatile(state.fec_full.get(), 0);
         }
 
         let conversion = |out, ifindex| Conversion {
@@ -861,6 +865,11 @@ impl Connection {
                 std::ptr::read_volatile(state.rx.get()),
             )
         }
+    }
+
+    /// The number of packets left to Phantun so far, as the ring buffer for FEC records was full
+    pub fn fec_full(&self) -> u64 {
+        unsafe { std::ptr::read_volatile(self.state().fec_full.get()) }
     }
 
     /// The number of packets converted so far

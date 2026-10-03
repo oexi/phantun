@@ -6,7 +6,7 @@ use crate::offload;
 use crate::udp;
 use clap::{Arg, ArgAction, ArgMatches};
 use fake_tcp::Socket;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +92,7 @@ pub async fn forward(
     // Checked once per UDP_TTL rather than reset by every packet, so a connection is closed after
     // UDP_TTL to twice that without traffic
     let mut offloaded_packets = offloaded.as_ref().map_or(0, |c| c.packets());
+    let mut fec_full = 0;
     loop {
         tokio::select! {
             _ = time::sleep(UDP_TTL) => {},
@@ -107,6 +108,17 @@ pub async fn forward(
             return;
         }
         offloaded_packets = packets;
+
+        // Those packets are sent and received in a different order than the others
+        let full = offloaded.as_ref().map_or(0, |c| c.fec_full());
+        if full != fec_full {
+            warn!(
+                "eBPF left {} packets to Phantun in the last {:?}, as the ring buffer for FEC records was full",
+                full.wrapping_sub(fec_full),
+                UDP_TTL
+            );
+            fec_full = full;
+        }
     }
 }
 
